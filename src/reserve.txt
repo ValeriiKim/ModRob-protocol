@@ -1,4 +1,4 @@
-
+#include "stdio.h"
 // Библиотеки микроконтроллера
 // #include "stm32f1xx_hal.h"
 #include "stm32f1xx.h"
@@ -8,24 +8,38 @@
 #include "can_stm32.h"
 #include "TestMaster.h"
 
+// Различные вспомогательные библиотеки
+#include "lwrb.h"
+extern "C"
+{
+	#include "ringbuffer.h"
+}
+
 #define ARRAY_LEN(x)  (sizeof(x) / sizeof((x)[0])) // определение числа элементов массива
 
 #define SYSCLOCK 72000000U // максимальная частота контроллера
 
 #define GREEN_LED_ON    SET_BIT(GPIOC->BSRR, GPIO_BSRR_BR13);
 #define GREEN_LED_OFF   SET_BIT(GPIOC->BSRR, GPIO_BSRR_BS13);
+#define TESTPIN_ON      SET_BIT(GPIOA->BSRR, GPIO_BSRR_BR9);
+#define TESTPIN_OFF     SET_BIT(GPIOA->BSRR, GPIO_BSRR_BS9);
 
 // Глобальные переменные
 volatile uint32_t tmpreg;
 volatile uint32_t SysTick_CNT = 0;
 
-// Переменные для USART2 DMA
-static uint8_t usart_rx_dma_buffer[64];
-char usart_tx_dma_buffer[] = "Cosmic Space Commando Base\n";
-uint8_t flag_rx = 0, flag_tx = 0;
+// Переменные для работы с буфером UART (DMA TX и приём RX)
+// Набор переменных для буфера передачи TX
+static lwrb_t usart_dma_tx_buff;
+static uint8_t usart_dma_tx_buff_data[256];
+static size_t usart_dma_tx_len;
+// Набор переменных для буфера приёма RX
+static uint8_t usart_rx_rawbuf[128];
+static lwrb_t usart_rx_ringbuf;
+static uint8_t usart_rx_ringbuf_data[128];
 
-
-void Clock_DeInit()
+/* Сброс настроек тактового генератора */
+void clock_deinit()
 {
 	// Включаем в начале HSI (внутренний генератор 8 МГц)
 	SET_BIT(RCC->CR, RCC_CR_HSION);
@@ -54,6 +68,7 @@ void Clock_DeInit()
 	CLEAR_REG(RCC->CIR);
 }
 
+/* Настройка частоты тактирования микроконтроллера на 72 МГц */
 void clock_init()
 {
 	// Настройка системной частоты на 72 МГц
@@ -100,7 +115,7 @@ void clock_init()
 }
 
 /* Общая конфигурация системы: вызов функции настройки частоты тактирования 
-на 72 МГц, включение тактирвоания AFIO, настройка портов для прошивания */
+на 72 МГц, включение тактирования AFIO, настройка портов для прошивания */
 void system_config(void)
 { 
 	clock_init();
@@ -114,6 +129,7 @@ void system_config(void)
 
 }
 
+/* Настройка частоты системного счётчика для отсчёта тиков с периодом 1 мс */
 void sys_tick_init()
 {
 	CLEAR_BIT(SysTick->LOAD, SysTick_LOAD_RELOAD_Msk);
@@ -128,53 +144,53 @@ void sys_tick_init()
 	SET_BIT(SysTick->CTRL, SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk);   
 }
 
-void GPIO_setup()
+/** Установка задержки в заданное количество миллисекунд
+*@param ms Число миллисекунд вызываемой задержки
+ */
+void delay_ms(uint32_t ms)
+{
+    CLEAR_BIT(SysTick->VAL, SysTick_VAL_CURRENT_Msk);
+	SET_BIT(SysTick->VAL, SYSCLOCK/1000 - 1);
+	SysTick_CNT = ms;
+	while(SysTick_CNT) {}
+}
+
+/* Общая настройка портов ввода/вывода */
+void gpio_setup()
 {
 	// включаем тактирование портов ввода/вывода А, В и С для отладки
 	SET_BIT(RCC->APB2ENR, RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_IOPCEN);
 	// ждём
 	tmpreg = READ_BIT(RCC->APB2ENR, RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_IOPCEN);
-	// настраиваем порт С на выход push-pull с максимальной скоростью 50 МГц
+	// настраиваем порт С13 на выход push-pull с максимальной скоростью 50 МГц
 	CLEAR_BIT(GPIOC->CRH, GPIO_CRH_CNF13);
 	SET_BIT(GPIOC->CRH, GPIO_CRH_MODE13);
+	// настраиваем порт A9 на выход push-pull с максимальной скоростью 50 МГц
+	CLEAR_BIT(GPIOA->CRH, GPIO_CRH_CNF9);
+	SET_BIT(GPIOA->CRH, GPIO_CRH_MODE9);
 }
 
 
 /* Инициализация DMA1 для USART2, функция должна быть вызвана внутри
-функции USART2_Init перед настройкой управляющих регистров */
-static void DMA1_init_for_USART2()
+функции USART2_Init перед настройкой управляющих регистров. На данный момент
+решено использовать DMA только для передачи (TX), поскольку согласно концепции не
+планируется отправлять от компьютера большой поток данных вниз на модуль. Достаточно будет
+отправлять небольшие команды или установки каких-то переменных, адресов и т.д. */
+static void dma1_init_for_usart2()
 {
 	// включаем тактирование контроллера DMA1
 	RCC->AHBENR |= RCC_AHBENR_DMA1EN;
 	tmpreg = (RCC->AHBENR & RCC_AHBENR_DMA1EN);
 
-	/* USART2 DMA Initialisation
-	Настройка USART2_RX */
-	// Настройка направления передачи - Peripheral to Memory
-	DMA1_Channel6->CCR &= ~(DMA_CCR_DIR | DMA_CCR_MEM2MEM);
-	// устанавливаем уровень приоритета - Low (пока непонятно какой нужен)
-	DMA1_Channel6->CCR &= ~DMA_CCR_PL;
-	// Режим передачи Circular mode 
-	DMA1_Channel6->CCR |= DMA_CCR_CIRC;
-	//Set peripheral to NO increment mode DMA_CCR_PINC = 0
-	DMA1_Channel6->CCR &= ~DMA_CCR_PINC;
-	//Set memory increment mode
-	DMA1_Channel6->CCR |= DMA_CCR_MINC;
-	// Set peripheral data width - устанавливаем ширину данных с периферии
-	// нужно 8 бит, поскольку USART получает 8 бит полезных данных
-	DMA1_Channel6->CCR &= ~(DMA_CCR_PSIZE_1 | DMA_CCR_PSIZE_0);
-	// Set memory data width - устанавливаем ширину данных в памяти
-	// здесь тоже нужно 8 бит для согласованности
-	DMA1_Channel6->CCR &= ~(DMA_CCR_MSIZE_1 | DMA_CCR_MSIZE_0);
+	NVIC_SetPriority(DMA1_Channel7_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),0, 0));
+	NVIC_EnableIRQ(DMA1_Channel7_IRQn);
 
-	// Конфигурация адресов источника и приёмника для RX (read)
-	DMA1_Channel6->CPAR = (uint32_t)&(USART2->DR); // адрес регистра источника
-	DMA1_Channel6->CMAR = (uint32_t)usart_rx_dma_buffer; // адрес регистра приёмника
-	DMA1_Channel6->CNDTR &= ~DMA_CNDTR_NDT; // обнуляем число байтов, которые нужно отправить
-	DMA1_Channel6->CNDTR = ARRAY_LEN(usart_rx_dma_buffer); // и пишем сколько реально планируется принять
+	// На всякий случай выключаем канал 7 
+	DMA1_Channel7->CCR &= ~DMA_CCR_EN;
 
 	/* 
-	Настройка USART2_TX */
+	Настройка USART2_TX на передачу "наверх" к ПК. Пока что используется обычный фиксированный
+	буфер для передачи*/
 	// Настройка направления передачи - Memory to Peripheral
 	DMA1_Channel7->CCR &= ~DMA_CCR_MEM2MEM;
 	DMA1_Channel7->CCR |= DMA_CCR_DIR;
@@ -195,41 +211,24 @@ static void DMA1_init_for_USART2()
 
 	// Конфигурация адресов источника и приёмника для TX (write)
 	DMA1_Channel7->CPAR = (uint32_t)&(USART2->DR); // адрес регистра приёмника
-	DMA1_Channel7->CMAR = (uint32_t)usart_tx_dma_buffer;
 
-	// Enable Channel 6 Transfer complete interrupt and Transfer error interrupt
-	DMA1_Channel6->CCR |= DMA_CCR_TCIE | DMA_CCR_TEIE;
 	// Enable Channel 7 Transfer complete interrupt and Transfer error interrupt
 	DMA1_Channel7->CCR |= DMA_CCR_TCIE | DMA_CCR_TEIE;
 
-	// Clear Channel 6 global interrupt flag, transfer complete flag and transfer error flag
-	DMA1->IFCR = DMA_IFCR_CGIF6;
-	DMA1->IFCR = DMA_IFCR_CTCIF6;
-	DMA1->IFCR = DMA_IFCR_CTEIF6;
 	// Clear Channel 7 global interrupt flag, transfer complete flag and transfer error flag
     DMA1->IFCR = DMA_IFCR_CGIF7;
 	DMA1->IFCR = DMA_IFCR_CTCIF7;
 	DMA1->IFCR = DMA_IFCR_CTEIF7;
 
-	// DMA1_Channel6_IRQn interrupt init
-	// GREEN_LED_ON;
-	NVIC_EnableIRQ(DMA1_Channel6_IRQn);
-	// GREEN_LED_OFF;
-	// NVIC_SetPriority(DMA1_Channel7_IRQn, 0);
-	// NVIC_SetPriority(DMA1_Channel6_IRQn, 0);
-	// DMA1_Channel7_IRQn interrupt init
-	// GREEN_LED_ON;
-	NVIC_EnableIRQ(DMA1_Channel7_IRQn);
-	// GREEN_LED_OFF;
 
 }
 
 
-/* Инициализация USART2 - все настройки стандартные: асинхронный режим, 
+/* Инициализация USART2 - все настройки стандартные: асинхронный режим, фиксированная
    скорость 115200 бит/с, длина слова 8 бит, 1 стоп бит, контроля чётности нет,
    есть приём и передача
  */
-void USART2_init()
+void usart2_init()
 {
 	// инициализация USART2 
 	RCC->APB1ENR |= RCC_APB1ENR_USART2EN; // включаем тактирование USART2
@@ -246,12 +245,12 @@ void USART2_init()
 	
 	GPIOA->CRL |= GPIO_CRL_CNF3_0; // PA3 (RX): input floating
 
-	DMA1_init_for_USART2();
+	dma1_init_for_usart2();
 
 	/* настраиваем регистры USART2: асинхронный режим, включаем приём и передачу,
 	устанавливаем скорость передачи - baudrate (пока что фиксированная
 	скорость - 115200 бит/с), длина слова - 8 бит, 1 стоп бит */
-	if ((USART2->CR1 & USART_CR1_UE) != USART_CR1_UE) // проверяем, вдруг включен USART
+	if ((USART2->CR1 & USART_CR1_UE) != USART_CR1_UE) // проверяем, вдруг уже включен USART
 	{
 		USART2->CR1 &= ~(USART_CR1_M | USART_CR1_PCE | USART_CR1_PS);
 		USART2->CR1 |= USART_CR1_TE | USART_CR1_RE;
@@ -260,69 +259,108 @@ void USART2_init()
 	USART2->CR3 &= ~(USART_CR3_SCEN | USART_CR3_IREN | USART_CR3_HDSEL);
 	USART2->BRR = 0x138; // рассчитывалось по даташиту, равно 19.53
 	
-	//Enable DMA Mode for reception (DMAR) and transmission (DMAT)
-	USART2->CR3 |= USART_CR3_DMAR | USART_CR3_DMAT;
+	/* Включаем прерывания RXNE, которые генерируются если ORE=1 или RXNE=1 
+	в регистре статуса USART_SR, т.е соответственно при переполнении (ORE) и когда
+	принятые данные готовы к чтению (RXNE) */
+	USART2->CR1 |= USART_CR1_RXNEIE;
+
+	//Enable DMA Mode for transmission (DMAT) only
+	USART2->CR3 |= USART_CR3_DMAT;
 	
-	// Enable USART2 and DMA Channel 6 for USART RX
+	// На всякий случай очищаем регистр передачи данных USART2
+    USART2->DR = 0x00;
+	USART2->SR |= USART_SR_TC;
+
+	// разрешим глобальные прерывания USART2 для приёма данных по линии RX
+	NVIC_SetPriority(USART2_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 5, 1));
+    NVIC_EnableIRQ(USART2_IRQn);
+
+	// Включаем USART2
 	USART2->CR1 |= USART_CR1_UE; // enable USART2
-	// DMA1_Channel6->CCR |= DMA_CCR_EN;
-	
-
 
 }
 
-void process_usart_data(uint8_t* data, size_t length)
+/* Details here: https://github.com/MaJerle/stm32-usart-uart-dma-rx-tx
+ */
+inline uint8_t usart_start_tx_dma_transfer()
 {
-	const uint8_t* local_data = data;
-}
-
-// Details here: https://github.com/MaJerle/stm32-usart-uart-dma-rx-tx
-void check_rx_uart()
-{
-	static size_t old_pos;
-	size_t pos;
+	uint32_t old_primask;
+	uint8_t start_flag = 0;
 	
-	pos = ARRAY_LEN(usart_rx_dma_buffer) - DMA_CNDTR_NDT;
-	if (pos != old_pos)
+	old_primask = __get_PRIMASK();
+    __disable_irq();
+
+	// проверяем, что передача не активна в настоящий момент
+	if (usart_dma_tx_len == 0)
 	{
-		if (pos > old_pos)
-		{
-			process_usart_data(&usart_rx_dma_buffer[old_pos], pos - old_pos);
-		}
-		else
-		{
-			process_usart_data(&usart_rx_dma_buffer[old_pos], ARRAY_LEN(usart_rx_dma_buffer) - old_pos);
-			if (pos > 0)
-			{
-				process_usart_data(&usart_rx_dma_buffer[0], pos);
-			}
+		// проверяем, есть ли что отправлять
+		usart_dma_tx_len = lwrb_get_linear_block_read_length(&usart_dma_tx_buff);
+		if (usart_dma_tx_len > 0)
+		{	
+			// создаём указатель на первый элемент в линейном блоке буфера на передачу
+			void* ptr = lwrb_get_linear_block_read_address(&usart_dma_tx_buff);
+			// Выключаем 7 канал DMA
+			DMA1_Channel7->CCR &= ~DMA_CCR_EN;
+			DMA1->IFCR = DMA_IFCR_CTCIF7;
+			DMA1->IFCR = DMA_IFCR_CGIF7;
+	        DMA1->IFCR = DMA_IFCR_CTCIF7;
+	        DMA1->IFCR = DMA_IFCR_CTEIF7;
+			// Начинаем DMA передачу
+			// обнуляем число байт, которое следует отправить и пишем новое число
+			DMA1_Channel7->CNDTR &= ~DMA_CNDTR_NDT;
+			DMA1_Channel7->CNDTR = usart_dma_tx_len;
+			// устанавливаем адрес памяти для передачи
+			DMA1_Channel7->CMAR = (uint32_t)(ptr); // !тут static_cast не работает!
+			DMA1_Channel7->CCR |= DMA_CCR_EN;
+			start_flag = 1; 
 		}
 	}
-	old_pos = pos;
-	if (old_pos == ARRAY_LEN(usart_rx_dma_buffer))
+	__set_PRIMASK(old_primask);
+	return start_flag;
+}
+
+void usart_send_string(const char* str)
+{
+	// Записываем новые данные в буфер, только если предыдущая передача по USART уже закончилась
+	if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
 	{
-		old_pos = 0;
+		// USART2->SR &= ~USART_SR_TC;
+		lwrb_write(&usart_dma_tx_buff, str, strlen(str));
+		usart_start_tx_dma_transfer();
 	}
 }
+
+void usart_echo()
+{
+	// Начинаем передачу, только если предыдущая передача по USART уже закончилась
+	if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
+	{
+		// USART2->SR &= ~USART_SR_TC;
+		usart_start_tx_dma_transfer();
+	}
+}
+
 
 
 void serial_write(uint16_t size_of_data)
 {
-	DMA1_Channel7->CCR &= ~DMA_CCR_EN;
-	DMA1_Channel7->CNDTR &= ~DMA_CNDTR_NDT;
-	DMA1_Channel7->CNDTR = size_of_data;
-	DMA1_Channel7->CCR |= DMA_CCR_EN;
-	while (!flag_tx) {}
-	flag_tx = 0;
+	/* Только после того как я добавил проверку этого условия передача
+	по USART стала работать. Однако странно, что пример с narod stream
+	не заработал (с применением флага) для точно такого же контроллера... */
+
+	if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
+	{
+		DMA1_Channel7->CCR &= ~DMA_CCR_EN;
+	    DMA1_Channel7->CNDTR &= ~DMA_CNDTR_NDT;
+	    DMA1_Channel7->CNDTR = size_of_data;
+        DMA1_Channel7->CCR |= DMA_CCR_EN;
+	
+	}
 }
 
 
-void delay_ms(uint32_t ms)
+void echo_usart()
 {
-    CLEAR_BIT(SysTick->VAL, SysTick_VAL_CURRENT_Msk);
-	SET_BIT(SysTick->VAL, SYSCLOCK/1000 - 1);
-	SysTick_CNT = ms;
-	while(SysTick_CNT) {}
 }
 
 
@@ -330,23 +368,29 @@ int main() {
 
 	system_config();
 	sys_tick_init();
-	GPIO_setup();
+	gpio_setup();
 
     GREEN_LED_OFF;
+	TESTPIN_OFF;
 
-	USART2_init();
+	usart2_init();
+	lwrb_init(&usart_dma_tx_buff, usart_dma_tx_buff_data, sizeof(usart_dma_tx_buff_data));
+	lwrb_init(&usart_rx_ringbuf, usart_rx_ringbuf_data, sizeof(usart_rx_ringbuf_data));
 
-
-	char sample_string[40];
-	// strncpy(usart_tx_dma_buffer, "Hi there! Something doesnt work \n", ARRAY_LEN(usart_tx_dma_buffer));
+	usart_send_string("Module successfully initialized\n");
 
 	while(1) 
 	{
-		// GREEN_LED_ON;
+		// usart_send_string("Cosmic Space Commando Base\n");
+		usart_echo();
 		// delay_ms(100);
-		// GREEN_LED_OFF;
-		// delay_ms(100);
-		serial_write(strlen(usart_tx_dma_buffer));
+		// for (int j = 0; j < 100; j++)
+		// {
+		// 	snprintf(usart_tx_dma_buffer, 32, "%i", j);
+		// 	strcat(usart_tx_dma_buffer, "\n");
+		// 	serial_write(strlen(usart_tx_dma_buffer));
+		//     delay_ms(50);
+		// }
 	}
 
 	return 0;
@@ -365,16 +409,22 @@ extern "C"
     }
 }
 
-// Обработчик прерывания от периферии (USART2-RX) к памяти
+// обработчик прерывания от памяти к периферии (USART2-TX)
 extern "C" 
 {
-	void DMA1_Channel6_IRQHandler(void)
+	void DMA1_Channel7_IRQHandler(void)
 	{
-		if ((DMA1->ISR & DMA_ISR_TCIF6) == DMA_ISR_TCIF6) // сработало прерывание по окончанию передачи
+		
+		if ((DMA1->ISR & DMA_ISR_TCIF7) == DMA_ISR_TCIF7) // сработало прерывание по окончанию передачи
 		{
-			DMA1->IFCR = DMA_IFCR_CTCIF6; // Clear TCIF6 in DMA_ISR register
+			GREEN_LED_ON;
+			DMA1->IFCR = DMA_IFCR_CTCIF7;
+			lwrb_skip(&usart_dma_tx_buff, usart_dma_tx_len);
+			usart_dma_tx_len = 0;
+			usart_start_tx_dma_transfer();
+			GREEN_LED_OFF;
 		}
-		else if ((DMA1->ISR & DMA_ISR_TEIF6) == DMA_ISR_TEIF6) // произошла ошибка передачи
+		else if ((DMA1->ISR & DMA_ISR_TEIF7) == DMA_ISR_TEIF7)
 		{
 			// выключаем оба канала DMA
 			DMA1_Channel6->CCR &= ~DMA_CCR_EN;
@@ -383,25 +433,32 @@ extern "C"
 	}
 }
 
-// обработчик прерывания от памяти к периферии (USART2-TX)
-extern "C" 
+
+
+extern "C"
 {
-	void DMA1_Channel7_IRQHandler(void)
+	/* Обработка прерывания по переносу данных из сдвигового регистра в USART_DR при приёме данных по RX */
+	void USART2_IRQHandler(void) 
 	{
-		GREEN_LED_ON;
-		GREEN_LED_OFF;
-		if ((DMA1->ISR & DMA_ISR_TCIF7) == DMA_ISR_TCIF7) // сработало прерывание по окончанию передачи
+		// произошло прерывание по получению данных: RXNE = 1
+		if ((USART2->SR & USART_SR_RXNE) == USART_SR_RXNE)
 		{
-			DMA1->IFCR = DMA_IFCR_CTCIF7;
-			flag_tx = 1;
+			TESTPIN_ON;
+			uint8_t temp_byte[1];
+			temp_byte[0] = static_cast<uint8_t>((USART2->DR & 0xFF));
+			// lwrb_write(&usart_rx_ringbuf, &temp_byte, 1);
+			lwrb_write(&usart_dma_tx_buff, temp_byte, 1); // для самотестировония
+			// ring_buffer_queue(&usart_rx_buffer, temp_byte);
+			TESTPIN_OFF;
 		}
-		else if ((DMA1->ISR & DMA_ISR_TEIF7) == DMA_ISR_TEIF7)
+
+		// произошла ошибка по переполнению ORE = 1
+		if ((USART2->SR & USART_SR_ORE) == USART_SR_ORE)
 		{
-			// выключаем оба канала DMA
-			DMA1_Channel6->CCR &= ~DMA_CCR_EN;
-			DMA1_Channel7->CCR &= ~DMA_CCR_EN;
+			// просто очищаем этот флаг как указано в даташите
+			(void) USART2->SR; // читаем регистр SR
+			(void) USART2->DR; // и регистр DR
 		}
-		GREEN_LED_ON;
-		GREEN_LED_OFF;
+
 	}
 }

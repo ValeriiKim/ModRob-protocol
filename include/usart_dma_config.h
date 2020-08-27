@@ -28,7 +28,7 @@ namespace usart2
 		// включаем тактирование контроллера DMA1
 		RCC->AHBENR |= RCC_AHBENR_DMA1EN;
 		tmpreg = (RCC->AHBENR & RCC_AHBENR_DMA1EN);
-
+		// устанавливаем приоритет канала DMA (пока точно неясно какой нужен)
 		NVIC_SetPriority(DMA1_Channel7_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 0, 0));
 		NVIC_EnableIRQ(DMA1_Channel7_IRQn);
 
@@ -166,19 +166,20 @@ Details here: https://github.com/MaJerle/stm32-usart-uart-dma-rx-tx
 		return start_flag;
 	}
 
+
 /** Отправка константной строки по USART2 с помощью DMA 
 *@param str указатель на строку  
  */
 	void usart_send_string(const char *str)
 	{
 		// Записываем новые данные в буфер, только если предыдущая передача по USART уже закончилась
-		// while((USART2->SR & USART_SR_TC) != USART_SR_TC) {}
-		if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
-		{
+		while((USART2->SR & USART_SR_TC) != USART_SR_TC) {}
+		// if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
+		// {
 			USART2->SR &= ~USART_SR_TC;
 			lwrb_write(&usart_dma_tx_buff, str, strlen(str));
 			usart_start_tx_dma_transfer();
-		}
+		// }
 	}
 
 	/* Функция для передачи полученных по RX байт в TX (режим loop-back)
@@ -317,6 +318,11 @@ newline равно true
 			(void)USART2->SR; // читаем регистр SR
 			(void)USART2->DR; // и регистр DR
 		}
+	}
+
+	void char_to_str(unsigned char* input, char* output)
+	{
+		snprintf(output, 9, "%8s", input);
 	}
 
 } // namespace usart2

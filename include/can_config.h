@@ -1,25 +1,8 @@
-// Главная тестовая прошивка для отладки различной периферии
+#include "stm32f1xx.h"
+#include "string.h"
 
-// #include "stdio.h"
-// Библиотеки микроконтроллера
-#include "board_config.h"
-#include "usart_dma_config.h"
-
-// Библиотеки CanFestival
-#include "canfestival.h"
-#include "can_stm32.h"
-#include "TestMaster.h"
-#include "can_config.h"
-
-
-// Различные вспомогательные библиотеки
-// #include "lwrb.h"
-
-#define GREEN_LED_ON    SET_BIT(GPIOC->BSRR, GPIO_BSRR_BR13);
-#define GREEN_LED_OFF   SET_BIT(GPIOC->BSRR, GPIO_BSRR_BS13);
-#define TESTPIN_ON      SET_BIT(GPIOA->BSRR, GPIO_BSRR_BR9);
-#define TESTPIN_OFF     SET_BIT(GPIOA->BSRR, GPIO_BSRR_BS9);
-
+namespace can_bus
+{
 #define STANDARD_FORMAT  0
 #define EXTENDED_FORMAT  1
 
@@ -36,29 +19,59 @@ enum class CanTestMode: uint8_t
 };
 
 struct CAN_Message
-    {
-        unsigned int id;
-        unsigned char data[8];
-        unsigned char len;
-        unsigned char format;
-        unsigned char type;
-    };
+{
+	unsigned int id;	   // 29 bit identifier
+	unsigned char data[8]; // data field
+	unsigned char len;	   // length of data field
+	unsigned char format;  // format: standard or extended
+	unsigned char type;	   // type: data or remote frame
+
+/* Конструктор для создания пустого CAN сообщения */
+	CAN_Message()
+	{
+		unsigned int id   = 0U;
+		memset(data, 0, 8);
+		unsigned char len = 8U;
+		unsigned char format = STANDARD_FORMAT;
+		unsigned char type = DATA_FRAME;
+	}
+
+/** Конструктор для создания CAN сообщения с определённым 
+ * содержанием по умолчанию используем расширенный формат кадра
+ * 
+ *  @param _id      Message ID
+ *  @param _data    Mesaage Data
+ *  @param _len     Message Data length
+ *  @param _type    Type of Data: EXTENDED_FORMAT or STANDARD_FORMAT
+ *  @param _format  Data Format: DATA_FRAME or REMOTE_FRAME
+ */
+    CAN_Message(unsigned int _id, const unsigned char *_data, unsigned char _len = 8,
+	            unsigned char _format = EXTENDED_FORMAT, unsigned char _type = DATA_FRAME)
+	{
+		id = _id;
+		memcpy(data, _data, _len);
+		len = _len & 0xF;
+		format = _format;
+		type = _type;
+	}
+};
 
 /** Настраиваем bxCAN: пины, скорость 1 Мбит/с, прерывания, а также фильтры.
  * После того как эта функция выполнится, bxCAN всё ещё будет находиться в режиме ИНИЦИАЛИЗАЦИИ */
 void can_setup()
 {
-	// включаем тактирование CAN1 
-	RCC->APB1ENR |= RCC_APB1ENR_CAN1EN; 
-	// сбрасываем CAN remap
-	AFIO->MAPR &= ~AFIO_MAPR_CAN_REMAP;
-	// режим CAN remap 10: CANRx на PB8, CANTx на PB9
-	AFIO->MAPR |= AFIO_MAPR_CAN_REMAP_REMAP2;
-	// настраиваем PB8 на вход с pull-up (?)
-	GPIOB->CRH &= ~(GPIO_CRH_CNF8 | GPIO_CRH_MODE8);
+/* 	(1) Включаем тактирование CAN1 
+	(2) Сбрасываем CAN remap
+	(3) Режим CAN remap 10: CANRx на PB8, CANTx на PB9
+	(4) Настраиваем PB8 на вход с pull-up (?)
+	(5) Настраиваем PB9 на выход в режиме alternate output push pull 
+*/
+	RCC->APB1ENR |= RCC_APB1ENR_CAN1EN;                // (1)
+	AFIO->MAPR &= ~AFIO_MAPR_CAN_REMAP;                // (2) 
+	AFIO->MAPR |= AFIO_MAPR_CAN_REMAP_REMAP2;          // (3)
+	GPIOB->CRH &= ~(GPIO_CRH_CNF8 | GPIO_CRH_MODE8);   // (4)
 	GPIOB->CRH |= GPIO_CRH_CNF8_1;
-	// настраиваем PB9 на выход в режиме alternate output push pull
-	GPIOB->CRH &= ~(GPIO_CRH_CNF9 | GPIO_CRH_MODE9);
+	GPIOB->CRH &= ~(GPIO_CRH_CNF9 | GPIO_CRH_MODE9);   // (5)
 	GPIOB->CRH |= GPIO_CRH_MODE9_1 | GPIO_CRH_MODE9_0;
 	GPIOB->CRH |= GPIO_CRH_CNF9_1;
 	
@@ -68,25 +81,25 @@ void can_setup()
 	// NVIC_SetPriority(USB_HP_CAN1_TX_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 4, 0));
 	// NVIC_EnableIRQ(USB_HP_CAN1_TX_IRQn);
 
-	// переход в режим инициализации
-	CAN1->MCR |= CAN_MCR_INRQ;
-	// ожидание установки режима инициализации
-	while ((CAN1->MSR & CAN_MSR_INAK) != CAN_MSR_INAK) {}
-	// на всякий случай сбрасываем бит SLEEP чтобы выйти из режима сна
-	CAN1->MCR &= ~CAN_MCR_SLEEP;
-	// выключаем автоматическую переотправку сообщений
-	CAN1->MCR |= CAN_MCR_NART;
-	// выключение режима Time Triggered Communication Mode
-	CAN1->MCR &= ~CAN_MCR_TTCM;
-	// выключение режима Automatic bus-off management
-	CAN1->MCR &= ~CAN_MCR_ABOM;
-	// выключение режима Automatic wakeup mode
-	CAN1->MCR &= ~CAN_MCR_AWUM;
-	// FIFO не блокируется, если оно заполнено: новое сообщение будет 
-	// перезаписывать предыдущее
-	CAN1->MCR &= ~CAN_MCR_RFLM;
-	// приоритет передачи сообщений определяется идентификаторами
-	CAN1->MCR &= ~CAN_MCR_TXFP;
+/* 	(1) Переход в режим инициализации
+	(2) Ожидание установки режима инициализации
+	(3) На всякий случай сбрасываем бит SLEEP чтобы выйти из режима сна
+	(4) Выключаем автоматическую переотправку сообщений
+	(5) Выключение режима Time Triggered Communication Mode
+	(6) Выключение режима Automatic bus-off management
+	(7) Выключение режима Automatic wakeup mode
+	(8) FIFO не блокируется, если оно заполнено: новое сообщение будет перезаписывать предыдущее
+	(9) Приоритет передачи сообщений определяется идентификаторами
+*/
+	CAN1->MCR |= CAN_MCR_INRQ;   // (1)
+	while ((CAN1->MSR & CAN_MSR_INAK) != CAN_MSR_INAK) {}  // (2)
+	CAN1->MCR &= ~CAN_MCR_SLEEP; // (3)
+	CAN1->MCR |= CAN_MCR_NART;   // (4)
+	CAN1->MCR &= ~CAN_MCR_TTCM;  // (5)
+	CAN1->MCR &= ~CAN_MCR_ABOM;  // (6)
+	CAN1->MCR &= ~CAN_MCR_AWUM;  // (7)
+	CAN1->MCR &= ~CAN_MCR_RFLM;  // (8)
+	CAN1->MCR &= ~CAN_MCR_TXFP;  // (9)
 
 /* Настройка скорости CAN-шины на 1 Мбит/с 
     (1) На всякий случай очищаем биты прескейлера
@@ -246,95 +259,4 @@ uint8_t can_read(CAN_Message *msg)
 	return 1;
 }
 
-CAN_Message can_output_msg, can_input_msg;
-
-int main() {
-
-	board::system_config();
-	board::sys_tick_init();
-	board::gpio_setup();
-	usart2::usart2_init();
-
-    GREEN_LED_OFF;
-	TESTPIN_OFF;
-
-	can_setup();
-	usart2::usart_send_string("CAN controller inited\n");
-	// can_set_test_mode(CanTestMode::LoopBackMode);
-	// usart2::usart_send_string("Set loop back mode for CAN\n");
-	can_start();
-	usart2::usart_send_string("CAN controller started\n");
-
-
-	char data[] = "12345678";
-	can_output_msg.id = 1024;
-	for (int i = 0; i < 8; i++) can_output_msg.data[i] = data[i];
-	can_output_msg.len = 8;
-	can_output_msg.format = EXTENDED_FORMAT;
-	can_output_msg.type = DATA_FRAME;
-
-	char debug_str[9] = {0};
-	memcpy(can_output_msg.data, can_input_msg.data, 8);
-
-	while(1) 
-	{
-		board::delay_ms(100);
-		can_write(&can_output_msg);
-		// if (can_rx_ready)
-		// {
-		// 	can_rx_ready = 0;
-		// }
-		// usart2::char_to_str(can_input_msg.data, debug_str);
-		// usart2::usart_send_string(debug_str);
-		// usart2::usart_send_string("\n");
-	}
-
-	return 0;
-}
-
-/* Нужно добавлять для обработчиков прерываний (пока непонятно для всех
-или для только SysTick) обёртку, которая позволяет воспринимать 
-участок кода как код языка С (НЕ С++). Без этого функции обработчиков
-прерываний не хотят работать  */
-extern "C" 
-{
-    void SysTick_Handler(void) 
-    {
-    	board::systick_delay_handler();
-    }
-}
-
-// обработчик прерывания от памяти к периферии (USART2-TX)
-extern "C" 
-{
-	void DMA1_Channel7_IRQHandler(void)
-	{
-		TESTPIN_ON;
-		usart2::transfer_handler_irq();
-		TESTPIN_OFF;
-	}
-}
-
-
-
-extern "C"
-{
-	/* Обработка прерывания по переносу данных из сдвигового регистра в USART_DR при приёме данных по RX */
-	void USART2_IRQHandler(void) 
-	{
-		usart2::receive_handler_irq();
-	}
-}
-
-extern "C"
-{
-	void USB_LP_CAN1_RX0_IRQHandler(void)
-	{
-		if (CAN1->RF0R & CAN_RF0R_FMP0) // FMP0 > 0? 
-		{
-			// есть как минимум одно сообщение в FIFO0
-			can_read(&can_input_msg);
-			can_rx_ready = 1;
-		}
-	}
-}
+} // namespace CAN1

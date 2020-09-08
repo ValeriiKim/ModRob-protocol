@@ -1,8 +1,12 @@
+#ifndef CAN_CONFIG_H
+#define CAN_CONFIG_H
+
 #include "stm32f1xx.h"
 #include "string.h"
 
 namespace can_bus
 {
+	
 #define STANDARD_FORMAT  0
 #define EXTENDED_FORMAT  1
 
@@ -37,16 +41,16 @@ struct CAN_Message
 	}
 
 /** Конструктор для создания CAN сообщения с определённым 
- * содержанием по умолчанию используем расширенный формат кадра
+ * содержанием по умолчанию используем стандартный формат кадра
  * 
  *  @param _id      Message ID
- *  @param _data    Mesaage Data
+ *  @param _data    Message Data
  *  @param _len     Message Data length
  *  @param _type    Type of Data: EXTENDED_FORMAT or STANDARD_FORMAT
  *  @param _format  Data Format: DATA_FRAME or REMOTE_FRAME
  */
     CAN_Message(unsigned int _id, const unsigned char *_data, unsigned char _len = 8,
-	            unsigned char _format = EXTENDED_FORMAT, unsigned char _type = DATA_FRAME)
+	            unsigned char _format = STANDARD_FORMAT, unsigned char _type = DATA_FRAME)
 	{
 		id = _id;
 		memcpy(data, _data, _len);
@@ -57,11 +61,13 @@ struct CAN_Message
 };
 
 /** Настраиваем bxCAN: пины, скорость 1 Мбит/с, прерывания, а также фильтры.
- * После того как эта функция выполнится, bxCAN всё ещё будет находиться в режиме ИНИЦИАЛИЗАЦИИ */
-void can_setup()
+ * После того как эта функция выполнится, bxCAN всё ещё будет находиться в режиме ИНИЦИАЛИЗАЦИИ 
+ * @param rx_interrupt флаг включащий прерывания по приёму сообщений
+ */
+void can_setup(bool rx_interrupt)
 {
 /* 	(1) Включаем тактирование CAN1 
-	(2) Сбрасываем CAN remap
+	(2) Сбрасываем CAN remap, чтобы направить RX и TX на другие порты
 	(3) Режим CAN remap 10: CANRx на PB8, CANTx на PB9
 	(4) Настраиваем PB8 на вход с pull-up (?)
 	(5) Настраиваем PB9 на выход в режиме alternate output push pull 
@@ -75,9 +81,12 @@ void can_setup()
 	GPIOB->CRH |= GPIO_CRH_MODE9_1 | GPIO_CRH_MODE9_0;
 	GPIOB->CRH |= GPIO_CRH_CNF9_1;
 	
-	// включение прерываний для CAN - RX
-	NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 4, 0));
-	NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
+	// включение прерываний для CAN - RX в зависимости от флага
+	if (rx_interrupt)
+	{
+		NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 4, 0));
+	    NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
+	}
 	// NVIC_SetPriority(USB_HP_CAN1_TX_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 4, 0));
 	// NVIC_EnableIRQ(USB_HP_CAN1_TX_IRQn);
 
@@ -117,8 +126,8 @@ void can_setup()
 
 /* Настройка прерываний: включаем прерывание по получению сообщения в FIFO0,
 пока непонятно, нужно ли использовать другой буфер (FIFO1).
- */
-    CAN1->IER |= CAN_IER_FMPIE0;
+*/
+    if (rx_interrupt) {CAN1->IER |= CAN_IER_FMPIE0;}
 
 /* Настройка фильтра - пока что фильтр настроен следующим образом - 
 узел просто принимает все сообщения, которые есть на шине. На самом деле он должен
@@ -145,7 +154,7 @@ void can_setup()
 	CAN1->FMR &= ~CAN_FMR_FINIT;                    // (9)
 }
 
-/* Выходим из режима инициализации и переходим в нормальный режим */
+/* Выходим из режима инициализации bxCAN и переходим в нормальный режим */
 void can_start()
 {
 	CAN1->MCR &= ~CAN_MCR_INRQ;
@@ -225,15 +234,20 @@ uint8_t can_write(CAN_Message *msg)
 uint8_t can_read(CAN_Message *msg)
 {
 	/** Используем нулевой mailbox
- *  (1) Получаем информацию об идентификаторе входящего сообщения 
- *  (2) Поскольку мы отправляем только data фреймы, то присваиваем типу 
+ *  (1) Проверяем, есть ли хотя бы одно сообщение в FIFO0
+ *  (2) Получаем информацию об идентификаторе входящего сообщения 
+ *  (3) Поскольку мы отправляем только data фреймы, то присваиваем типу 
  *      входящего сообщения DATA_FRAME
- *  (3) Читаем длину полезной нагрузки - число полученных байт (обычно 8)
- *  (4) Извлекаем из регистра RDLR младшие байты данных 
- *  (5) Извлекаем из регистра RDHR старшие байты данных 
- *  (6) Устанавливаем бит RF0M0 чтобы освободить FIFO0 (очищаем mailbox)
+ *  (4) Читаем длину полезной нагрузки - число полученных байт (обычно 8)
+ *  (5) Извлекаем из регистра RDLR младшие байты данных 
+ *  (6) Извлекаем из регистра RDHR старшие байты данных 
+ *  (7) Устанавливаем бит RF0M0 чтобы освободить FIFO0 (уменьшаем число FMP0)
 */
-    if ((CAN1->sFIFOMailBox[0].RIR & CAN_ID_EXT) == 0)                 // (1)
+    if ((CAN1->RF0R & CAN_RF0R_FMP0) == 0)                             // (1)
+	{
+		return 0; // сообщений нет
+	}
+    if ((CAN1->sFIFOMailBox[0].RIR & CAN_ID_EXT) == 0)                 // (2)
 	{
 		msg->format = STANDARD_FORMAT;
 		msg->id = (CAN1->sFIFOMailBox[0].RIR >> 21) & 0x000007FFU; // 7FF = 11 битовых единиц
@@ -243,20 +257,33 @@ uint8_t can_read(CAN_Message *msg)
 		msg->format = EXTENDED_FORMAT;
 		msg->id = (CAN1->sFIFOMailBox[0].RIR >> 3) & 0x1FFFFFFFU; // 1FFFFFFF = 29 битовых единиц
 	}
-	msg->type = DATA_FRAME;                                           // (2)  
-	msg->len = CAN1->sFIFOMailBox[0].RDTR & CAN_RDT0R_DLC;            // (3)
-	msg->data[0] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR);        // (4)
+	msg->type = DATA_FRAME;                                           // (3)  
+	msg->len = CAN1->sFIFOMailBox[0].RDTR & CAN_RDT0R_DLC;            // (4)
+	msg->data[0] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR);        // (5)
 	msg->data[1] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR >> 8);
 	msg->data[2] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR >> 16);
 	msg->data[3] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR >> 24);
 
-	msg->data[4] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR);        // (5)
+	msg->data[4] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR);        // (6)
 	msg->data[5] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR >> 8);
 	msg->data[6] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR >> 16);
 	msg->data[7] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR >> 24);
 	
-	CAN1->RF0R |= CAN_RF0R_RFOM0;                                     // (6)
+	CAN1->RF0R |= CAN_RF0R_RFOM0;                                     // (7)
 	return 1;
 }
 
+
+/**
+ * Обработчик прерывания по приёму сообщений, нужен если включены прерывания. Эта функция 
+ * должна быть размещена внутри функции void USB_LP_CAN1_RX0_IRQHandler(void) 
+*/
+inline void can_rx0_irq_handler(CAN_Message *msg)
+{
+	can_read(msg);
+	can_rx_ready = 1;
+}
+
 } // namespace CAN1
+
+#endif

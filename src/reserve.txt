@@ -1,396 +1,295 @@
-#include "stdio.h"
+// Главная тестовая прошивка для отладки различной периферии
+
+// #include "stdio.h"
 // Библиотеки микроконтроллера
-// #include "stm32f1xx_hal.h"
-#include "stm32f1xx.h"
+#include "board_config.h"
+#include "usart_dma_config.h"
 
 // Библиотеки CanFestival
 #include "canfestival.h"
 #include "can_stm32.h"
 #include "TestMaster.h"
+#include "can_config.h"
+#include "modrob_can.hpp"
 
 // Различные вспомогательные библиотеки
-#include "lwrb.h"
-extern "C"
-{
-	#include "ringbuffer.h"
-}
-
-#define ARRAY_LEN(x)  (sizeof(x) / sizeof((x)[0])) // определение числа элементов массива
-
-#define SYSCLOCK 72000000U // максимальная частота контроллера
+// #include "lwrb.h"
 
 #define GREEN_LED_ON    SET_BIT(GPIOC->BSRR, GPIO_BSRR_BR13);
 #define GREEN_LED_OFF   SET_BIT(GPIOC->BSRR, GPIO_BSRR_BS13);
 #define TESTPIN_ON      SET_BIT(GPIOA->BSRR, GPIO_BSRR_BR9);
 #define TESTPIN_OFF     SET_BIT(GPIOA->BSRR, GPIO_BSRR_BS9);
 
-// Глобальные переменные
-volatile uint32_t tmpreg;
-volatile uint32_t SysTick_CNT = 0;
+#define STANDARD_FORMAT  0
+#define EXTENDED_FORMAT  1
 
-// Переменные для работы с буфером UART (DMA TX и приём RX)
-// Набор переменных для буфера передачи TX
-static lwrb_t usart_dma_tx_buff;
-static uint8_t usart_dma_tx_buff_data[256];
-static size_t usart_dma_tx_len;
-// Набор переменных для буфера приёма RX
-static uint8_t usart_rx_rawbuf[128];
-static lwrb_t usart_rx_ringbuf;
-static uint8_t usart_rx_ringbuf_data[128];
+#define DATA_FRAME       0
+#define REMOTE_FRAME     1
 
-/* Сброс настроек тактового генератора */
-void clock_deinit()
+uint8_t can_rx_ready = 0;
+
+enum class CanTestMode: uint8_t
 {
-	// Включаем в начале HSI (внутренний генератор 8 МГц)
-	SET_BIT(RCC->CR, RCC_CR_HSION);
-	// ждём пока не стабилизируется (определяется по флагу HSIRDY)
-	while(READ_BIT(RCC->CR, RCC_CR_HSIRDY) == RESET) {}
-	// сбрасываем калибровку
-	// TODO: понять почему здесь 0х80 и переписать командами SET
-	MODIFY_REG(RCC->CR, RCC_CR_HSITRIM, 0x80U);
-	// очищаем конфигурационный регистр
-	CLEAR_REG(RCC->CFGR);
-	// ждём очистки флага SWS
-	while (READ_BIT(RCC->CFGR, RCC_CFGR_SWS) != RESET) {}
-	// отключаем PLL
-	CLEAR_BIT(RCC->CR, RCC_CR_PLLON);
-	// ждём пока контроллер не отпустит PLL (пока PLLRDY не станет равным 0)
-	while (READ_BIT(RCC->CR, RCC_CR_PLLRDY) != RESET) {}
-	// выключаем HSE и его детектор тактового сигнала
-	CLEAR_BIT(RCC->CR, RCC_CR_HSEON | RCC_CR_CSSON);
-	// ожидание пока HSE не отключится
-	while (READ_BIT(RCC->CR, RCC_CR_HSERDY) != RESET) {}
-	// сброс бита разрешающего использование внешнего генератора
-	CLEAR_BIT(RCC->CR, RCC_CR_HSEBYP);
-	// сброс всех флагов прерываний от RCC
-	SET_BIT(RCC->CSR, RCC_CSR_RMVF);
-	// запрет всех прерываний от RCC
-	CLEAR_REG(RCC->CIR);
-}
+	SilentMode = 0,
+	LoopBackMode = 1,
+	LoopBackSilentMode = 2
+};
 
-/* Настройка частоты тактирования микроконтроллера на 72 МГц */
-void clock_init()
+struct CAN_Message
+    {
+        unsigned int id;
+        unsigned char data[8];
+        unsigned char len;
+        unsigned char format;
+        unsigned char type;
+    };
+
+/** Настраиваем bxCAN: пины, скорость 1 Мбит/с, прерывания, а также фильтры.
+ * После того как эта функция выполнится, bxCAN всё ещё будет находиться в режиме ИНИЦИАЛИЗАЦИИ */
+void can_setup()
 {
-	// Настройка системной частоты на 72 МГц
-	// Включим внешнее тактирование HSE и дождёмся его включения
-	SET_BIT(RCC->CR, RCC_CR_HSEON);
-    while(READ_BIT(RCC->CR, RCC_CR_HSERDY) == RESET) {}
+	// включаем тактирование CAN1 
+	RCC->APB1ENR |= RCC_APB1ENR_CAN1EN; 
+	// сбрасываем CAN remap
+	AFIO->MAPR &= ~AFIO_MAPR_CAN_REMAP;
+	// режим CAN remap 10: CANRx на PB8, CANTx на PB9
+	AFIO->MAPR |= AFIO_MAPR_CAN_REMAP_REMAP2;
+	// настраиваем PB8 на вход с pull-up (?)
+	GPIOB->CRH &= ~(GPIO_CRH_CNF8 | GPIO_CRH_MODE8);
+	GPIOB->CRH |= GPIO_CRH_CNF8_1;
+	// настраиваем PB9 на выход в режиме alternate output push pull
+	GPIOB->CRH &= ~(GPIO_CRH_CNF9 | GPIO_CRH_MODE9);
+	GPIOB->CRH |= GPIO_CRH_MODE9_1 | GPIO_CRH_MODE9_0;
+	GPIOB->CRH |= GPIO_CRH_CNF9_1;
+	
+	// включение прерываний для CAN - RX
+	NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 4, 0));
+	NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
+	// NVIC_SetPriority(USB_HP_CAN1_TX_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 4, 0));
+	// NVIC_EnableIRQ(USB_HP_CAN1_TX_IRQn);
 
-	// настройка памяти FLASH, включается буфер предварительной выборки,
-	// сначала он отключается, затем включается максимальная задержка
-	CLEAR_BIT(FLASH->ACR, FLASH_ACR_PRFTBE);
-    SET_BIT(FLASH->ACR, FLASH_ACR_PRFTBE);
+	// переход в режим инициализации
+	CAN1->MCR |= CAN_MCR_INRQ;
+	// ожидание установки режима инициализации
+	while ((CAN1->MSR & CAN_MSR_INAK) != CAN_MSR_INAK) {}
+	// на всякий случай сбрасываем бит SLEEP чтобы выйти из режима сна
+	CAN1->MCR &= ~CAN_MCR_SLEEP;
+	// выключаем автоматическую переотправку сообщений
+	CAN1->MCR |= CAN_MCR_NART;
+	// выключение режима Time Triggered Communication Mode
+	CAN1->MCR &= ~CAN_MCR_TTCM;
+	// выключение режима Automatic bus-off management
+	CAN1->MCR &= ~CAN_MCR_ABOM;
+	// выключение режима Automatic wakeup mode
+	CAN1->MCR &= ~CAN_MCR_AWUM;
+	// FIFO не блокируется, если оно заполнено: новое сообщение будет 
+	// перезаписывать предыдущее
+	CAN1->MCR &= ~CAN_MCR_RFLM;
+	// приоритет передачи сообщений определяется идентификаторами
+	CAN1->MCR &= ~CAN_MCR_TXFP;
 
-	// кажется в исходнике ошибка, FLASH_ACR_LATENCY_1 = 010 (то что нужно)
-	// а FLASH_ACR_LATENCY_2, который везде указывается, на самом деле 100, такого режима нет 
-    CLEAR_BIT(FLASH->ACR, FLASH_ACR_LATENCY);
-	SET_BIT(FLASH->ACR, FLASH_ACR_LATENCY_1);
+/* Настройка скорости CAN-шины на 1 Мбит/с 
+    (1) На всякий случай очищаем биты прескейлера
+    (2) Устанавливаем прескейлер для скорости 1 Мбит/с
+    (3) Обнуляем биты Time Segment 1 и Time Segment 2
+    (4) Устанавливаемы биты Time Segment 1 так, чтобы получилось число 110 = 6
+    (5) Устанавливаем биты SJW в 0 (чтобы потом получить 1)
+*/
+	uint8_t prescaler = 0x03;
+	CAN1->BTR &= ~CAN_BTR_BRP;                    // (1)
+	CAN1->BTR |= prescaler;                       // (2)
+	CAN1->BTR &= ~(CAN_BTR_TS1 | CAN_BTR_TS2);    // (3) 
+	CAN1->BTR |= (CAN_BTR_TS1_1 | CAN_BTR_TS1_2); // (4)
+	CAN1->BTR &= ~CAN_BTR_SJW;                    // (5)   
 
-    // настраиваем делитель /1 AHB Prescaler
-	CLEAR_BIT(RCC->CFGR, RCC_CFGR_HPRE);
-	SET_BIT(RCC->CFGR, RCC_CFGR_HPRE_DIV1);
-
-	// настройка делителя /1 APB2 Prescaler
-	CLEAR_BIT(RCC->CFGR, RCC_CFGR_PPRE2);
-	SET_BIT(RCC->CFGR, RCC_CFGR_PPRE2_DIV1);
-
-	// настраиваем делитель /2 APB1 Prescaler
-	CLEAR_BIT(RCC->CFGR, RCC_CFGR_PPRE1);
-	SET_BIT(RCC->CFGR, RCC_CFGR_PPRE1_DIV2);
-
-	// сбрасываем биты PLLSRC, PLLXTPRE, PLLMUL
-	CLEAR_BIT(RCC->CFGR, RCC_CFGR_PLLSRC | RCC_CFGR_PLLXTPRE | RCC_CFGR_PLLMULL);
-	// выбираем HSE осциллятор как вход для PLL
-	SET_BIT(RCC->CFGR, RCC_CFGR_PLLSRC);
-	// настраиваем PLLMul на коэффициент 9
-	SET_BIT(RCC->CFGR, RCC_CFGR_PLLMULL9);
-    // включаем PLL и ждём пока он не заблокируется
-	SET_BIT(RCC->CR, RCC_CR_PLLON);
-	while(READ_BIT(RCC->CR, RCC_CR_PLLRDY) == RESET) {}
-	// выбираем PLL в качестве источника системного тактирования
-	CLEAR_BIT(RCC->CFGR, RCC_CFGR_SW); // сначала очищаем биты SW
-	SET_BIT(RCC->CFGR, RCC_CFGR_SW_PLL);
-	while(READ_BIT(RCC->CFGR, RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) {}
-
-}
-
-/* Общая конфигурация системы: вызов функции настройки частоты тактирования 
-на 72 МГц, включение тактирования AFIO, настройка портов для прошивания */
-void system_config(void)
-{ 
-	clock_init();
-	// включение тактирования AFIO
-	SET_BIT(RCC->APB2ENR, RCC_APB2ENR_AFIOEN);
-	tmpreg = READ_BIT(RCC->APB2ENR, RCC_APB2ENR_AFIOEN);
-	// сбрасываем настройки SWD и JTAG
-	CLEAR_BIT(AFIO->MAPR, AFIO_MAPR_SWJ_CFG);
-	// и устанавливаем режим 010 - JTAG-DP Disabled and SW-DP Enabled
-	SET_BIT(AFIO->MAPR, AFIO_MAPR_SWJ_CFG_JTAGDISABLE);
-
-}
-
-/* Настройка частоты системного счётчика для отсчёта тиков с периодом 1 мс */
-void sys_tick_init()
-{
-	CLEAR_BIT(SysTick->LOAD, SysTick_LOAD_RELOAD_Msk);
-	// задаётся значение RELOAD, чтобы бы период был равен 1 мс
-	// T = (RELOAD + 1)/freq, RELOAD = T*freq - 1 = 0.001*72000000 - 1
-	SET_BIT(SysTick->LOAD, SYSCLOCK/1000 - 1);
-	NVIC_SetPriority (SysTick_IRQn, (1UL << __NVIC_PRIO_BITS) - 1UL);
-	// сброс счётчика
-	CLEAR_BIT(SysTick->VAL, SysTick_VAL_CURRENT_Msk);
-	// настройка управляющего регистра: установка системной частоты, разрешение
-	// прерываний и включение счётчика
-	SET_BIT(SysTick->CTRL, SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk);   
-}
-
-/** Установка задержки в заданное количество миллисекунд
-*@param ms Число миллисекунд вызываемой задержки
+/* Настройка прерываний: включаем прерывание по получению сообщения в FIFO0,
+пока непонятно, нужно ли использовать другой буфер (FIFO1).
  */
-void delay_ms(uint32_t ms)
-{
-    CLEAR_BIT(SysTick->VAL, SysTick_VAL_CURRENT_Msk);
-	SET_BIT(SysTick->VAL, SYSCLOCK/1000 - 1);
-	SysTick_CNT = ms;
-	while(SysTick_CNT) {}
+    CAN1->IER |= CAN_IER_FMPIE0;
+
+/* Настройка фильтра - пока что фильтр настроен следующим образом - 
+узел просто принимает все сообщения, которые есть на шине. На самом деле он должен
+игнорировать свои сообщения, однако пока непонятно, как настроить фильтр
+    (1) Входим в режим инициализации фильтра
+    (2) Деактивируем фильтр под номером 0
+	(3) Установка конфигурации - Single 32-bit scale configuration
+	(4) Два 32 битных регистра фильтра в режиме маски
+	(5) Устанавливаем регистр идентификатора в 0
+	(6) Устанавливаем регистр маски в 0
+	(7) Сообщения с фильтра 0 будут попадать в FIFO0
+	(8) Активируем нулевой фильтр
+	(9) Выходим из режима инициализации и активируем банки фильтров
+ */ 
+    static uint32_t CAN_filter_ID0 = 0x00;
+    CAN1->FMR |= CAN_FMR_FINIT;                     // (1) 
+	CAN1->FA1R &= ~(1 << CAN_filter_ID0);           // (2)
+	CAN1->FS1R |= (1 << CAN_filter_ID0);            // (3)
+	CAN1->FM1R &= ~(1 << CAN_filter_ID0);           // (4)
+	CAN1->sFilterRegister[CAN_filter_ID0].FR1 = 0;  // (5)
+	CAN1->sFilterRegister[CAN_filter_ID0].FR2 = 0;  // (6)
+	CAN1->FFA1R &= ~(1 << CAN_filter_ID0);          // (7)
+	CAN1->FA1R |= (1 << CAN_filter_ID0);            // (8)
+	CAN1->FMR &= ~CAN_FMR_FINIT;                    // (9)
 }
 
-/* Общая настройка портов ввода/вывода */
-void gpio_setup()
+/* Выходим из режима инициализации и переходим в нормальный режим */
+void can_start()
 {
-	// включаем тактирование портов ввода/вывода А, В и С для отладки
-	SET_BIT(RCC->APB2ENR, RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_IOPCEN);
-	// ждём
-	tmpreg = READ_BIT(RCC->APB2ENR, RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_IOPCEN);
-	// настраиваем порт С13 на выход push-pull с максимальной скоростью 50 МГц
-	CLEAR_BIT(GPIOC->CRH, GPIO_CRH_CNF13);
-	SET_BIT(GPIOC->CRH, GPIO_CRH_MODE13);
-	// настраиваем порт A9 на выход push-pull с максимальной скоростью 50 МГц
-	CLEAR_BIT(GPIOA->CRH, GPIO_CRH_CNF9);
-	SET_BIT(GPIOA->CRH, GPIO_CRH_MODE9);
+	CAN1->MCR &= ~CAN_MCR_INRQ;
+	while ((CAN1->MSR & CAN_MSR_INAK) == CAN_MSR_INAK) {}
 }
 
-
-/* Инициализация DMA1 для USART2, функция должна быть вызвана внутри
-функции USART2_Init перед настройкой управляющих регистров. На данный момент
-решено использовать DMA только для передачи (TX), поскольку согласно концепции не
-планируется отправлять от компьютера большой поток данных вниз на модуль. Достаточно будет
-отправлять небольшие команды или установки каких-то переменных, адресов и т.д. */
-static void dma1_init_for_usart2()
+/** Устанавливаем режим Test mode: silent mode, loop back mode или loop back 
+ * silent mode. Функция должна быть вызвана, когда bxCAN находится в режиме 
+ * инициализации
+*@param mode режим, который нужно установить из num class CanTestMode 
+*/
+void can_set_test_mode(CanTestMode mode)
 {
-	// включаем тактирование контроллера DMA1
-	RCC->AHBENR |= RCC_AHBENR_DMA1EN;
-	tmpreg = (RCC->AHBENR & RCC_AHBENR_DMA1EN);
-
-	NVIC_SetPriority(DMA1_Channel7_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),0, 0));
-	NVIC_EnableIRQ(DMA1_Channel7_IRQn);
-
-	// На всякий случай выключаем канал 7 
-	DMA1_Channel7->CCR &= ~DMA_CCR_EN;
-
-	/* 
-	Настройка USART2_TX на передачу "наверх" к ПК. Пока что используется обычный фиксированный
-	буфер для передачи*/
-	// Настройка направления передачи - Memory to Peripheral
-	DMA1_Channel7->CCR &= ~DMA_CCR_MEM2MEM;
-	DMA1_Channel7->CCR |= DMA_CCR_DIR;
-	// установка уровня приоритета - Low (пока непонятно какой нужен)
-	DMA1_Channel7->CCR &= ~DMA_CCR_PL;
-	// Режим передачи NORMAL - Circular mode disabled 
-	DMA1_Channel7->CCR &= ~DMA_CCR_CIRC;
-	//Set peripheral to NO increment mode DMA_CCR_PINC = 0
-	DMA1_Channel7->CCR &= ~DMA_CCR_PINC;
-	//Set memory increment mode
-	DMA1_Channel7->CCR |= DMA_CCR_MINC;
-	// Set peripheral data width - устанавливаем ширину данных с периферии
-	// нужно 8 бит, поскольку USART получает 8 бит полезных данных
-	DMA1_Channel7->CCR &= ~(DMA_CCR_PSIZE_1 | DMA_CCR_PSIZE_0);
-	// Set memory data width - устанавливаем ширину данных в памяти
-	// здесь тоже нужно 8 бит для согласованности
-	DMA1_Channel7->CCR &= ~(DMA_CCR_MSIZE_1 | DMA_CCR_MSIZE_0);
-
-	// Конфигурация адресов источника и приёмника для TX (write)
-	DMA1_Channel7->CPAR = (uint32_t)&(USART2->DR); // адрес регистра приёмника
-
-	// Enable Channel 7 Transfer complete interrupt and Transfer error interrupt
-	DMA1_Channel7->CCR |= DMA_CCR_TCIE | DMA_CCR_TEIE;
-
-	// Clear Channel 7 global interrupt flag, transfer complete flag and transfer error flag
-    DMA1->IFCR = DMA_IFCR_CGIF7;
-	DMA1->IFCR = DMA_IFCR_CTCIF7;
-	DMA1->IFCR = DMA_IFCR_CTEIF7;
-
-
-}
-
-
-/* Инициализация USART2 - все настройки стандартные: асинхронный режим, фиксированная
-   скорость 115200 бит/с, длина слова 8 бит, 1 стоп бит, контроля чётности нет,
-   есть приём и передача
- */
-void usart2_init()
-{
-	// инициализация USART2 
-	RCC->APB1ENR |= RCC_APB1ENR_USART2EN; // включаем тактирование USART2
-	tmpreg = RCC->APB1ENR & RCC_APB1ENR_USART2EN;
-	/* Настройка портов - сначала нужно сбросить все настройки, 
-	настройка порта PA2 (TX) на выход с максимальной скоростью,
-	режим - alternate function push-pull.
-	настройка порта PA3 (RX) на вход с режимом floating input */
-	GPIOA->CRL &= ~(GPIO_CRL_CNF2 | GPIO_CRL_MODE2);
-	GPIOA->CRL &= ~(GPIO_CRL_CNF3 | GPIO_CRL_MODE3);
-
-	GPIOA->CRL |= GPIO_CRL_MODE2_1 | GPIO_CRL_MODE2_0; // 0b11 50MHz output
-	GPIOA->CRL |= GPIO_CRL_CNF2_1; // PA2 (TX): output 50MHz - Alt-function Push-pull
-	
-	GPIOA->CRL |= GPIO_CRL_CNF3_0; // PA3 (RX): input floating
-
-	dma1_init_for_usart2();
-
-	/* настраиваем регистры USART2: асинхронный режим, включаем приём и передачу,
-	устанавливаем скорость передачи - baudrate (пока что фиксированная
-	скорость - 115200 бит/с), длина слова - 8 бит, 1 стоп бит */
-	if ((USART2->CR1 & USART_CR1_UE) != USART_CR1_UE) // проверяем, вдруг уже включен USART
+	CAN1->BTR &= ~(CAN_BTR_SILM | CAN_BTR_LBKM);
+	switch (mode)
 	{
-		USART2->CR1 &= ~(USART_CR1_M | USART_CR1_PCE | USART_CR1_PS);
-		USART2->CR1 |= USART_CR1_TE | USART_CR1_RE;
+	case CanTestMode::SilentMode:
+	{
+		CAN1->BTR |= CAN_BTR_SILM;
+		break;
 	}
-	USART2->CR2 &= ~(USART_CR2_LINEN | USART_CR2_CLKEN);
-	USART2->CR3 &= ~(USART_CR3_SCEN | USART_CR3_IREN | USART_CR3_HDSEL);
-	USART2->BRR = 0x138; // рассчитывалось по даташиту, равно 19.53
-	
-	/* Включаем прерывания RXNE, которые генерируются если ORE=1 или RXNE=1 
-	в регистре статуса USART_SR, т.е соответственно при переполнении (ORE) и когда
-	принятые данные готовы к чтению (RXNE) */
-	USART2->CR1 |= USART_CR1_RXNEIE;
-
-	//Enable DMA Mode for transmission (DMAT) only
-	USART2->CR3 |= USART_CR3_DMAT;
-	
-	// На всякий случай очищаем регистр передачи данных USART2
-    USART2->DR = 0x00;
-	USART2->SR |= USART_SR_TC;
-
-	// разрешим глобальные прерывания USART2 для приёма данных по линии RX
-	NVIC_SetPriority(USART2_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 5, 1));
-    NVIC_EnableIRQ(USART2_IRQn);
-
-	// Включаем USART2
-	USART2->CR1 |= USART_CR1_UE; // enable USART2
-
-}
-
-/* Details here: https://github.com/MaJerle/stm32-usart-uart-dma-rx-tx
- */
-inline uint8_t usart_start_tx_dma_transfer()
-{
-	uint32_t old_primask;
-	uint8_t start_flag = 0;
-	
-	old_primask = __get_PRIMASK();
-    __disable_irq();
-
-	// проверяем, что передача не активна в настоящий момент
-	if (usart_dma_tx_len == 0)
+	case CanTestMode::LoopBackMode:
 	{
-		// проверяем, есть ли что отправлять
-		usart_dma_tx_len = lwrb_get_linear_block_read_length(&usart_dma_tx_buff);
-		if (usart_dma_tx_len > 0)
-		{	
-			// создаём указатель на первый элемент в линейном блоке буфера на передачу
-			void* ptr = lwrb_get_linear_block_read_address(&usart_dma_tx_buff);
-			// Выключаем 7 канал DMA
-			DMA1_Channel7->CCR &= ~DMA_CCR_EN;
-			DMA1->IFCR = DMA_IFCR_CTCIF7;
-			DMA1->IFCR = DMA_IFCR_CGIF7;
-	        DMA1->IFCR = DMA_IFCR_CTCIF7;
-	        DMA1->IFCR = DMA_IFCR_CTEIF7;
-			// Начинаем DMA передачу
-			// обнуляем число байт, которое следует отправить и пишем новое число
-			DMA1_Channel7->CNDTR &= ~DMA_CNDTR_NDT;
-			DMA1_Channel7->CNDTR = usart_dma_tx_len;
-			// устанавливаем адрес памяти для передачи
-			DMA1_Channel7->CMAR = (uint32_t)(ptr); // !тут static_cast не работает!
-			DMA1_Channel7->CCR |= DMA_CCR_EN;
-			start_flag = 1; 
-		}
+		CAN1->BTR |= CAN_BTR_LBKM;
+		break;
 	}
-	__set_PRIMASK(old_primask);
-	return start_flag;
-}
-
-void usart_send_string(const char* str)
-{
-	// Записываем новые данные в буфер, только если предыдущая передача по USART уже закончилась
-	if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
+	case CanTestMode::LoopBackSilentMode:
 	{
-		// USART2->SR &= ~USART_SR_TC;
-		lwrb_write(&usart_dma_tx_buff, str, strlen(str));
-		usart_start_tx_dma_transfer();
+		CAN1->BTR |= CAN_BTR_SILM | CAN_BTR_LBKM;
+		break;
 	}
-}
-
-void usart_echo()
-{
-	// Начинаем передачу, только если предыдущая передача по USART уже закончилась
-	if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
-	{
-		// USART2->SR &= ~USART_SR_TC;
-		usart_start_tx_dma_transfer();
+	default:
+		break;
 	}
 }
 
 
-
-void serial_write(uint16_t size_of_data)
+uint8_t can_write(CAN_Message *msg)
 {
-	/* Только после того как я добавил проверку этого условия передача
-	по USART стала работать. Однако странно, что пример с narod stream
-	не заработал (с применением флага) для точно такого же контроллера... */
-
-	if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
+/** Используем нулевой mailbox
+ *  (1) Сброс регистра TIR  
+ *  (2) Установка идентификатора в регистр TIR в зависимости от типа фрейма (стандартный или расширенный)
+ *  (3) Будем отправлять только data фреймы, поэтому устанавливаем соответствующий 
+ *  бит в регистре TIR
+ *  (4) Записываем байты данных в регистры TDLR
+ *  (5) Записываем байты данных в регистры TDHR
+ *  (6) Сбрасываем биты DLC определяющие число байт данных
+ *  (7) Устанавливаем количество отправляемых байт в DLC - 8
+ *  (8) Запрос на отправку сообщения TXRQ = 1
+*/
+	CAN1->sTxMailBox[0].TIR = 0;                             // (1)
+	if (msg->format == STANDARD_FORMAT)                      // (2)
 	{
-		DMA1_Channel7->CCR &= ~DMA_CCR_EN;
-	    DMA1_Channel7->CNDTR &= ~DMA_CNDTR_NDT;
-	    DMA1_Channel7->CNDTR = size_of_data;
-        DMA1_Channel7->CCR |= DMA_CCR_EN;
-	
+		CAN1->sTxMailBox[0].TIR |= static_cast<uint32_t>(msg->id << 21) | CAN_ID_STD;
 	}
+	else
+	{
+		CAN1->sTxMailBox[0].TIR |= static_cast<uint32_t>(msg->id << 3) | CAN_ID_EXT;
+	}
+	CAN1->sTxMailBox[0].TIR |= CAN_RTR_DATA;                 // (3)
+	CAN1->sTxMailBox[0].TDLR = ((static_cast<uint32_t>(msg->data[3]) << 24U) |
+	                            (static_cast<uint32_t>(msg->data[2]) << 16U) |
+								(static_cast<uint32_t>(msg->data[1]) << 8U)  |
+								 static_cast<uint32_t>(msg->data[0])); // (4)
+
+	CAN1->sTxMailBox[0].TDHR = ((static_cast<uint32_t>(msg->data[7]) << 24U) |
+	                            (static_cast<uint32_t>(msg->data[6]) << 16U) |
+								(static_cast<uint32_t>(msg->data[5]) << 8U)  |
+								 static_cast<uint32_t>(msg->data[4])); // (5)
+
+	CAN1->sTxMailBox[0].TDTR &= ~CAN_TDT0R_DLC;              // (6)
+	CAN1->sTxMailBox[0].TDTR |= (msg->len & CAN_TDT0R_DLC);  // (7)
+	CAN1->sTxMailBox[0].TIR |= CAN_TI0R_TXRQ;                // (8)
+	return 1;
 }
 
-
-void echo_usart()
+uint8_t can_read(CAN_Message *msg)
 {
+	/** Используем нулевой mailbox
+ *  (1) Получаем информацию об идентификаторе входящего сообщения 
+ *  (2) Поскольку мы отправляем только data фреймы, то присваиваем типу 
+ *      входящего сообщения DATA_FRAME
+ *  (3) Читаем длину полезной нагрузки - число полученных байт (обычно 8)
+ *  (4) Извлекаем из регистра RDLR младшие байты данных 
+ *  (5) Извлекаем из регистра RDHR старшие байты данных 
+ *  (6) Устанавливаем бит RF0M0 чтобы освободить FIFO0 (очищаем mailbox)
+*/
+    if ((CAN1->sFIFOMailBox[0].RIR & CAN_ID_EXT) == 0)                 // (1)
+	{
+		msg->format = STANDARD_FORMAT;
+		msg->id = (CAN1->sFIFOMailBox[0].RIR >> 21) & 0x000007FFU; // 7FF = 11 битовых единиц
+	}
+	else
+	{
+		msg->format = EXTENDED_FORMAT;
+		msg->id = (CAN1->sFIFOMailBox[0].RIR >> 3) & 0x1FFFFFFFU; // 1FFFFFFF = 29 битовых единиц
+	}
+	msg->type = DATA_FRAME;                                           // (2)  
+	msg->len = CAN1->sFIFOMailBox[0].RDTR & CAN_RDT0R_DLC;            // (3)
+	msg->data[0] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR);        // (4)
+	msg->data[1] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR >> 8);
+	msg->data[2] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR >> 16);
+	msg->data[3] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDLR >> 24);
+
+	msg->data[4] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR);        // (5)
+	msg->data[5] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR >> 8);
+	msg->data[6] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR >> 16);
+	msg->data[7] = 0x000000FFU & (CAN1->sFIFOMailBox[0].RDHR >> 24);
+	
+	CAN1->RF0R |= CAN_RF0R_RFOM0;                                     // (6)
+	return 1;
 }
 
+CAN_Message can_output_msg, can_input_msg;
+CAN_Message msg1();
+
+CanModrobTransport can_transport(true);
 
 int main() {
 
-	system_config();
-	sys_tick_init();
-	gpio_setup();
+	board::system_config();
+	board::sys_tick_init();
+	board::gpio_setup();
+	usart2::usart2_init();
 
     GREEN_LED_OFF;
 	TESTPIN_OFF;
 
-	usart2_init();
-	lwrb_init(&usart_dma_tx_buff, usart_dma_tx_buff_data, sizeof(usart_dma_tx_buff_data));
-	lwrb_init(&usart_rx_ringbuf, usart_rx_ringbuf_data, sizeof(usart_rx_ringbuf_data));
+	can_setup();
+	usart2::usart_send_string("CAN controller inited\n");
+	// can_set_test_mode(CanTestMode::LoopBackMode);
+	// usart2::usart_send_string("Set loop back mode for CAN\n");
+	can_start();
+	usart2::usart_send_string("CAN controller started\n");
 
-	usart_send_string("Module successfully initialized\n");
+
+	char data[] = "12345678";
+	can_output_msg.id = 90;
+	for (int i = 0; i < 8; i++) can_output_msg.data[i] = data[i];
+	can_output_msg.len = 8;
+	can_output_msg.format = EXTENDED_FORMAT;
+	can_output_msg.type = DATA_FRAME;
+
+	char debug_str[9] = {0};
+	// can_transport.rx_buffer.emplace_back(msg1);
 
 	while(1) 
 	{
-		// usart_send_string("Cosmic Space Commando Base\n");
-		usart_echo();
-		// delay_ms(100);
-		// for (int j = 0; j < 100; j++)
+		board::delay_ms(100);
+		can_write(&can_output_msg);
+		// if (can_rx_ready)
 		// {
-		// 	snprintf(usart_tx_dma_buffer, 32, "%i", j);
-		// 	strcat(usart_tx_dma_buffer, "\n");
-		// 	serial_write(strlen(usart_tx_dma_buffer));
-		//     delay_ms(50);
+		// 	can_rx_ready = 0;
 		// }
+		// usart2::char_to_str(can_input_msg.data, debug_str);
+		// usart2::usart_send_string(debug_str);
+		// usart2::usart_send_string("\n");
 	}
 
 	return 0;
@@ -404,8 +303,7 @@ extern "C"
 {
     void SysTick_Handler(void) 
     {
-    	// SET_BIT(GPIOC->BSRR, GPIO_BSRR_BR13);
-    	if(SysTick_CNT > 0)  SysTick_CNT--;
+    	board::systick_delay_handler();
     }
 }
 
@@ -414,22 +312,9 @@ extern "C"
 {
 	void DMA1_Channel7_IRQHandler(void)
 	{
-		
-		if ((DMA1->ISR & DMA_ISR_TCIF7) == DMA_ISR_TCIF7) // сработало прерывание по окончанию передачи
-		{
-			GREEN_LED_ON;
-			DMA1->IFCR = DMA_IFCR_CTCIF7;
-			lwrb_skip(&usart_dma_tx_buff, usart_dma_tx_len);
-			usart_dma_tx_len = 0;
-			usart_start_tx_dma_transfer();
-			GREEN_LED_OFF;
-		}
-		else if ((DMA1->ISR & DMA_ISR_TEIF7) == DMA_ISR_TEIF7)
-		{
-			// выключаем оба канала DMA
-			DMA1_Channel6->CCR &= ~DMA_CCR_EN;
-			DMA1_Channel7->CCR &= ~DMA_CCR_EN;
-		}
+		TESTPIN_ON;
+		usart2::transfer_handler_irq();
+		TESTPIN_OFF;
 	}
 }
 
@@ -440,25 +325,20 @@ extern "C"
 	/* Обработка прерывания по переносу данных из сдвигового регистра в USART_DR при приёме данных по RX */
 	void USART2_IRQHandler(void) 
 	{
-		// произошло прерывание по получению данных: RXNE = 1
-		if ((USART2->SR & USART_SR_RXNE) == USART_SR_RXNE)
-		{
-			TESTPIN_ON;
-			uint8_t temp_byte[1];
-			temp_byte[0] = static_cast<uint8_t>((USART2->DR & 0xFF));
-			// lwrb_write(&usart_rx_ringbuf, &temp_byte, 1);
-			lwrb_write(&usart_dma_tx_buff, temp_byte, 1); // для самотестировония
-			// ring_buffer_queue(&usart_rx_buffer, temp_byte);
-			TESTPIN_OFF;
-		}
+		usart2::receive_handler_irq();
+	}
+}
 
-		// произошла ошибка по переполнению ORE = 1
-		if ((USART2->SR & USART_SR_ORE) == USART_SR_ORE)
+extern "C"
+{
+	void USB_LP_CAN1_RX0_IRQHandler(void)
+	{
+		if (CAN1->RF0R & CAN_RF0R_FMP0) // FMP0 > 0? 
 		{
-			// просто очищаем этот флаг как указано в даташите
-			(void) USART2->SR; // читаем регистр SR
-			(void) USART2->DR; // и регистр DR
+			// есть как минимум одно сообщение в FIFO0
+			can_read(&can_input_msg);
+			// can_transport.rx_buffer.emplace_back(can_input_msg);
+			can_rx_ready = 1;
 		}
-
 	}
 }

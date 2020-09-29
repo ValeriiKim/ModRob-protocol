@@ -16,7 +16,7 @@ class CanModrobTransport: public ModrobTransport
     CAN_Message transmitted_can_msg = {};
 
 public:
-    system::fixed_circular_buffer<CAN_Message, 10> rx_buffer{};
+    system::fixed_circular_buffer<CAN_Message, 20> rx_buffer{};
 
 /** Инициализация bxCAN МК STM32F103C8T6 - скорость фиксированная 
  * и составляет 1 Мбит/с, настраиваются пины PB8 (RX) и PB9 (TX)

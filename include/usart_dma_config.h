@@ -200,8 +200,12 @@ Details here: https://github.com/MaJerle/stm32-usart-uart-dma-rx-tx
 		// if ((USART2->SR & USART_SR_TC) == USART_SR_TC)
 		// {
 		USART2->SR &= ~USART_SR_TC;
-		lwrb_write(&usart_dma_tx_buff, str, strlen(str));
-		usart_start_tx_dma_transfer();
+		size_t len = strlen(str);
+		if (lwrb_get_free(&usart_dma_tx_buff) >= len){
+			lwrb_write(&usart_dma_tx_buff, str, strlen(str));
+		    usart_start_tx_dma_transfer();
+		}
+		
 		// }
 	}
 
@@ -238,7 +242,7 @@ newline равно true
 	uint8_t usart_send_int(int value, bool newline)
 	{
 		int result; 
-		char temp_buffer[32];
+		char temp_buffer[128];
 		char new_line[] = "\n";
 		size_t newline_size = 0;
 
@@ -338,12 +342,10 @@ newline равно true
 			// проверяем, получили ли мы лимитирующий символ строки, обычно это \n
 			if ((temp_byte[0] == limit_symbol) && limit_check_flag && !rx_data_copied)
 			{
-			    // TESTPIN_ON;
 			// переносим байты из главного буфера usart во временный буфер 
 				lwrb_read(&usart_rx_ringbuf, temp_buffer, sizeof(temp_buffer));
 			// устанавливаем флаг, что данные перенесены (сброс флага, после очистки буфера)
 				rx_data_copied = true;
-				// TESTPIN_OFF
 			}
 		}
 

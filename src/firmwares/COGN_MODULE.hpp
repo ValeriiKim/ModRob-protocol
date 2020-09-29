@@ -1,5 +1,5 @@
-#ifndef MODROB_TEST_MODULE_HPP
-#define MODROB_TEST_MODULE_HPP
+#ifndef MODROB_COGN_MODULE_HPP
+#define MODROB_COGN_MODULE_HPP
 
 // Главная тестовая прошивка для отладки различной периферии и протокола
 
@@ -13,6 +13,9 @@
 // Библиотеки протокола
 #include "modrob_can.hpp"
 #include "modrob_usart_logger.hpp"
+#include "modrob_serial_command.hpp"
+#include "modrob_serial_transport.hpp"
+#include "modrob_aggregator.hpp"
 
 
 // Макросы для дебага
@@ -21,8 +24,9 @@
 #define TESTPIN_ON      SET_BIT(GPIOA->BSRR, GPIO_BSRR_BR9);
 #define TESTPIN_OFF     SET_BIT(GPIOA->BSRR, GPIO_BSRR_BS9);
 
+SerialJSONTransport serial_transport;
 CanModrobTransport can_transport;
-// SerialCommander commander;
+SerialCommander commander;
 
 int main() {
 	board::system_config();
@@ -39,18 +43,19 @@ int main() {
 	TESTPIN_OFF;
 
 
-	Node node(MODULE_ID, MODULE_TYPE_ID);
+	Aggregator node(MODULE_ID, MODULE_TYPE_ID);
+	node.setUpperTransport(serial_transport);
 	node.setTransport(can_transport);
-
-	auto& var0 = node.createVariable(0, "var0", "scalar", 0.0);
 
 
 	while(1) 
 	{
+		// TESTPIN_ON;
 		node.run(timer2::get_micros());
-		// commander.run(node);
-
-		// usart2::usart_send_float(var0.get(), 1);
+		// TESTPIN_OFF;
+		commander.run(node);
+		// usart2::usart_send_float(12.23, 1);
+		// usart2::usart_send_string("12345678\n");
 
 	}
 
@@ -85,7 +90,7 @@ extern "C"
 	void USART2_IRQHandler(void) 
 	{
 		// usart2::receive_handler_irq();
-		// commander.serial_commander_IRQHandler();
+		commander.serial_commander_IRQHandler();
 	}
 }
 
@@ -107,4 +112,4 @@ extern "C"
 
 
 
-#endif //MODROB_TEST_HPP
+#endif 

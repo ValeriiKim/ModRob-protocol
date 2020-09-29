@@ -2,7 +2,7 @@
 #define CAN_CONFIG_H
 
 #include "stm32f1xx.h"
-#include "string.h"
+#include <string.h>
 
 namespace can_bus
 {

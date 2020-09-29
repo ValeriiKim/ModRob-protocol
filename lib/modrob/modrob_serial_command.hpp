@@ -4,16 +4,21 @@
 #include "modrob.hpp"
 #include "../ArduinoJson.h"
 #include "modrob_usart_logger.hpp"
+#include "modrob_aggregator.hpp"
 
 constexpr size_t MAX_LEN_OF_SERIAL_COMMAND = 256;
 constexpr size_t MAX_BUFFERED_COMMANDS     = 10;    
 
 #define COMMAND_GET_STATE "getState"
 
-#define COMMAND_FIELD     "op"
-#define COMMAND_SET_VAL   "setValue"
-#define COMMAND_SET_PUB   "setPublication"
-#define COMMAND_SET_SUB   "setSubscription"
+#define COMMAND_FIELD       "op"
+#define COMMAND_SET_VAL     "setValue"
+#define COMMAND_SET_PUB     "setPublication"
+#define COMMAND_SET_SUB     "setSubscription"
+#define COMMAND_START_LOG   "startLog"
+#define COMMAND_STOP_LOG    "stopLog"
+#define COMMAND_GET_PUB     "request_publishers_table"
+#define COMMAND_RESET_PUB   "removePublication"
 
 #define MOD_FIELD "modID"
 #define VAR_FIELD "varID"
@@ -44,12 +49,18 @@ struct Serial_Message
  * {"op": "setValue", "modID": N, "varID": N, "value": V}
  * {"op": "setPublication", "modID": N, "varID": N, "frequency": V}
  * {"op": "setSubscription", "modID": N, "varID": N, "subModID": V, "subVarID": V}
+ * {"op": "startLog", "modID": N, "varID": V}
+ * {"op": "request_publishers_table"}
+}
+
  *
  * events:
  *
  * Examples:
- * {"op": "setValue", "modID": 1, "varID": 1, "value": 23.23}
- * {"op": "setPublication", "modID": 1, "varID": 1, "frequency": 200}
+ * {"op": "setValue", "modID": 1, "varID": 0, "value": 23.23}
+ * {"op": "setPublication", "modID": 1, "varID": 0, "frequency": 200}
+ * {"op": "startLog", "modID": 1, "varID": 0}
+ * {"op": "stopLog", "modID": 1, "varID": 0}
  * {"op": "setSubscription", "modID": 0, "varID": 0, "subModID": 1, "subVarID": 1}
  */
 
@@ -68,7 +79,7 @@ private:
     string op = "";
     ModrobMessage msg;
 
-    void send_down(uint16_t modID, Node &node, ModrobMessage &msg)
+    void send_down(uint16_t modID, Aggregator &node, ModrobMessage &msg)
     {
         // если отправляем сообщение на сам модуль с Serial Commander
         if (modID == node.selfModuleID){
@@ -80,6 +91,7 @@ private:
             node.transport->send(msg);
         }
     }
+
 
     bool isCmdValid(){
         return doc.containsKey(COMMAND_FIELD) &&
@@ -118,12 +130,28 @@ private:
                doc[COMMAND_FIELD].as<string>() == COMMAND_SET_SUB;
     }
 
+    bool isValidStartLogCMD(){
+        return doc.containsKey(MOD_FIELD) &&
+               doc.containsKey(VAR_FIELD) &&
+               doc[COMMAND_FIELD].as<string>() == COMMAND_START_LOG;
+    }
+
+    bool isValidStopLogCMD(){
+        return doc.containsKey(MOD_FIELD) &&
+               doc.containsKey(VAR_FIELD) &&
+               doc[COMMAND_FIELD].as<string>() == COMMAND_STOP_LOG;
+    }
+
+    bool isValidGetPubTable(){
+        return doc[COMMAND_FIELD].as<string>() == COMMAND_GET_PUB;
+    }
+
 public:
     SerialCommander()
     {
         usart2::activate_check_of_rxlimit('\n');
     }
-    void run(Node &node)
+    void run(Aggregator &node)
     {
         if (not buffer_of_commands.empty())
         {
@@ -155,9 +183,17 @@ public:
                         {
                             auto modID = doc[MOD_FIELD].as<int>();
                             auto varID = doc[VAR_FIELD].as<int>();
-                            auto herz = doc[FRQ_FIELD].as<int>();
-                            msg = ModrobMessage::commandSetHertz(modID, varID, herz);
-                            send_down(modID, node, msg);
+                            auto hertz = doc[FRQ_FIELD].as<int>();
+                            if (hertz > 0) {
+                                node.add_new_publisher(modID, varID, hertz); // только если частота > 0
+                                msg = ModrobMessage::commandSetHertz(modID, varID, hertz);
+                                send_down(modID, node, msg);
+                            }
+                            if (hertz == 0) {
+                                node.remove_publisher(modID, varID);
+                                Logger::info("publisher removed");
+                            }
+                            if (hertz < 0) {Logger::warn("Frequency must be more than zero!");}
                         }
                         else if (isValidSetSubCMD())
                         {
@@ -167,6 +203,22 @@ public:
                             auto subVarID = doc[SVI_FIELD].as<int>();
                             msg = ModrobMessage::commandSetSubscriptionAddress(modID, varID, subModID, subVarID);
                             send_down(modID, node, msg);
+                        }
+                        else if (isValidStartLogCMD())
+                        {
+                            auto modID = doc[MOD_FIELD].as<int>();
+                            auto varID = doc[VAR_FIELD].as<int>();
+                            node.set_logging(modID, varID);
+                        }
+                        else if (isValidStopLogCMD())
+                        {
+                            auto modID = doc[MOD_FIELD].as<int>();
+                            auto varID = doc[VAR_FIELD].as<int>();
+                            node.reset_logging(modID, varID);
+                        }
+                        else if (isValidGetPubTable())
+                        {
+                            node.send_publishers_table();
                         }
                         else {
                             Logger::warn("Not match command");
@@ -186,7 +238,7 @@ public:
         }
     }
 
-    void serial_commander_IRQHandler()
+    inline void serial_commander_IRQHandler()
     {
         usart2::receive_handler_irq();
         // если данные скопированы, начинаем перенос данных в буфер сообщений

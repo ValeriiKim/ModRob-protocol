@@ -7,16 +7,20 @@
 #include <random>
 #include <cstdarg>
 #include <array>
-#include "string.h"
+#include <string.h>
 #include <bitset>
 #include "lwrb.h"
 #include "../lib/ArduinoJson.h"
+#include "../uthash.h"
+#include "../khash.h"
+#include "modrob_aggregator.hpp"
 
 #define STANDARD_FORMAT  0
 #define EXTENDED_FORMAT  1
 
 #define DATA_FRAME       0
 #define REMOTE_FRAME     1
+
 
 using namespace modrob;
 
@@ -87,6 +91,20 @@ struct CAN_Message
 	}
 };
 
+struct VariableInfo_2
+{
+    uint16_t moduleID;
+    uint8_t  variableID{0};
+    uint8_t  typeID;
+    uint16_t hertz{0};
+    float value;
+    // uint16_t subscribeFromModuleID{0};
+    // uint8_t  subscribeFromVariableID{0};
+    bool isChanged = false;
+    bool isLogged = false;
+};
+
+
 void assert_messages_equal(const ModrobMessage& actual, const ModrobMessage& expected)
 {
     TEST_ASSERT_EQUAL(actual.moduleID,         expected.moduleID);
@@ -102,6 +120,8 @@ void assert_messages_equal(const ModrobMessage& actual, const ModrobMessage& exp
 void test_size_of_structures(){
     cout << "Node: " << sizeof(Node) << " bytes" << endl;
     cout << "Variable: " << sizeof(Variable) << " bytes" << endl;
+    cout << "VariableInfo: " << sizeof(VariableInfo) << " bytes" << endl;
+    cout << "VariableInfo_2: " << sizeof(VariableInfo_2) << " bytes" << endl;
     cout << "ModrobMessage: " << sizeof(ModrobMessage) << " bytes" << endl;
 }
 
@@ -538,14 +558,6 @@ void test_lwrb_playground()
     // cout << last_byte[0] << endl;
 
 }
-template<typename T>
-unsigned count_non_val(T first, T last, const decltype(*first)& val){
-    unsigned result=0;
-    for(T i=first; i!=last; ++i)
-        if(*i!=val)
-            ++result;
-    return result;
-}
 
 void test_arduinojson()
 {
@@ -564,29 +576,297 @@ void test_arduinojson()
     cout << sensor << endl;
     cout << time << endl;
 
-    char serial_buffer[256] = {"abcdefgh\n"};
+    doc.clear();
+    doc["modID"] = 1;
+    doc["varID"] = 2;
+    doc["value"] = 23.43;
+    doc["hertz"] = 1500;
+
+    char serial_buffer[256] = "12345\n";
     cout << strlen(serial_buffer) << endl;
-    cout << serial_buffer[strlen(serial_buffer)] << endl;
-    TEST_ASSERT(serial_buffer[strlen(serial_buffer) - 1] == '\n');
+    cout << serial_buffer[strlen(serial_buffer)-2] << endl;
+    cout << "Number of bytes written by JSON: " << serializeJson(doc, serial_buffer) << endl;
+    cout << serial_buffer << endl;
+    cout << "Number of bytes returned by strlen: " << strlen(serial_buffer) << endl;
+    uint16_t hertz = 100;
 }
+
+
+void compose_hashID(int& id, uint16_t subModuleID, uint8_t subVariableID)
+{
+    id = ((subModuleID & 0xFFFFU) << 8U) | (subVariableID & 0xFF);
+}
+
+void decompose_hashID(int& id, uint16_t& subModuleID, uint8_t& subVariableID)
+{
+    subModuleID =  (id & 0xFFFF00U) >> 8U;
+    subVariableID = id & 0x0000FFU;
+}
+
+void test_compose_decompose_hashID()
+{
+    uint16_t subModID_after;
+    uint8_t  subVarID_after;
+    for (auto i=0; i < numberOfTestIteration; i++)
+    {
+        uint16_t subModID = rand16Bit();
+        uint8_t  subVarID = rand8Bit();
+        int id = 0;
+        compose_hashID(id, subModID, subVarID);
+        decompose_hashID(id, subModID_after, subVarID_after);
+        TEST_ASSERT_EQUAL(subModID, subModID_after);
+        TEST_ASSERT_EQUAL(subVarID, subVarID_after);
+    }
+}
+
+
+KHASH_MAP_INIT_INT(pub2, VariableInfo_2);
+khash_t(pub2) *publishers = kh_init(pub2);
+
+void khash_add(uint16_t pub_modID, uint8_t pub_varID, uint16_t pub_hertz)
+{
+    khint_t key;
+    int id = 0;
+    int ret;
+    compose_hashID(id, pub_modID, pub_varID);
+    key = kh_put(pub2, publishers, id, &ret);
+    if (ret == 0) {
+        cout << "The key is already present in table" << endl;
+        return;
+    }
+    kh_value(publishers, key).moduleID = pub_modID;
+    kh_value(publishers, key).variableID = pub_varID;
+    kh_value(publishers, key).hertz = pub_hertz;
+}
+
+void khash_print()
+{
+    khint_t key;
+    for (key = kh_begin(publishers); key != kh_end(publishers); ++key) {
+        if (kh_exist(publishers, key)) {
+            cout << "modID: " << kh_value(publishers, key).moduleID
+                 << ", varID: " << static_cast<int>(kh_value(publishers, key).variableID) 
+                 << ", frequency: " << kh_value(publishers, key).hertz << endl;
+        }
+    }
+}
+
+VariableInfo_2& khash_find(uint16_t modID_find, uint8_t varID_find, khint_t& check_key)
+{
+    int id_to_find;
+    khint_t key;
+    compose_hashID(id_to_find, modID_find, varID_find);
+    key = kh_get(pub2, publishers, id_to_find);
+    if (key == kh_end(publishers)) {
+        cout << "No such key!" << endl;
+    }
+    check_key = key;
+    cout << "FOUND modID: " << kh_value(publishers, key).moduleID
+         << ", varID: " << static_cast<int>(kh_value(publishers, key).variableID) 
+         << ", frequency: " << kh_value(publishers, key).hertz << endl;
+    return kh_value(publishers, key);
+}
+
+void khash_delete(uint16_t modID_to_del, uint8_t varID_to_del)
+{
+    int id_to_del;
+    khint_t key;
+    compose_hashID(id_to_del, modID_to_del, varID_to_del);
+    key = kh_get(pub2, publishers, id_to_del);
+    kh_del(pub2, publishers, key);
+}
+
+void test_modrob_hash_tables()
+{
+    unsigned int key;
+    khash_add(0, 1, 100);
+    khash_add(1, 2, 120);
+    khash_add(1, 5, 130);
+    khash_add(2, 11, 140);
+    khash_add(3, 1, 150);
+    khash_print();
+    TEST_ASSERT_EQUAL(5, kh_size(publishers));
+    VariableInfo_2 var_find = khash_find(2, 11, key);
+    TEST_ASSERT_EQUAL(2, var_find.moduleID);
+    TEST_ASSERT_EQUAL(11, var_find.variableID);
+    TEST_ASSERT_EQUAL(140, var_find.hertz);
+
+    khash_delete(3, 1);
+    TEST_ASSERT_EQUAL(4, kh_size(publishers));
+    khash_print();
+
+    cout << "Change frequency of variable 5 modID 1" << endl;
+    VariableInfo_2& var_to_change = khash_find(1, 5, key);
+    var_to_change.hertz = 999;
+    TEST_ASSERT_EQUAL(999, khash_find(1, 5, key).hertz);
+    khash_print();
+}
+
+float round2(float value)
+    {
+        float val = static_cast<int>(value * 100 + 0.5);
+        return val / 100;
+    }
+
+struct VirtualSerialTransport: public JSONTransport
+{
+    char serial_buffer[256];
+
+    VirtualSerialTransport()
+    {}
+
+    void send(const VariableInfo& variable, AggregatorMessage type) override
+    {
+        StaticJsonDocument<256> doc = {};
+        doc["modID"] = variable.moduleID;
+        doc["varID"] = variable.variableID;
+        doc["value"] = round2(variable.value);
+        doc["hertz"] = variable.hertz;
+        serializeJson(doc, serial_buffer);
+        serial_buffer[strlen(serial_buffer)] = '\n';
+        cout << serial_buffer;
+        memset(serial_buffer, 0, sizeof(serial_buffer));
+    }
+    bool receive(VariableInfo& result) override
+    {};
+};
+
+
+
+void test_modrob_aggregator()
+{
+    unsigned int check_key;
+    VirtualCanTransport::clear();
+    VirtualCanTransport can0 = VirtualCanTransport(0);
+    VirtualCanTransport can1 = VirtualCanTransport(1);
+    VirtualCanTransport can2 = VirtualCanTransport(2);
+
+    Aggregator broker(0, 0);
+    VirtualSerialTransport virtual_transport;
+    broker.setUpperTransport(virtual_transport);
+    broker.setTransport(can0);
+    broker.add_new_publisher(1, 1, 100);
+    broker.add_new_publisher(2, 2, 200);
+    broker.set_logging(1, 1);
+    broker.set_logging(2, 2);
+
+    Node node1 = Node(1, 1);
+    node1.setTransport(can1);
+    auto& var1 = node1.createVariable(1, "var1", "scalar", 0.0);
+
+    Node node2 = Node(2, 2);
+    node2.setTransport(can2);
+    auto& var2 = node2.createVariable(2, "var2", "scalar", 0.0);
+
+    auto pubNode1 = ModrobMessage::commandSetHertz(1, 1, 100);
+    auto pubNode2 = ModrobMessage::commandSetHertz(2, 2, 200);
+    auto setVar1  = ModrobMessage::commandSetValue(1, 1, 12.12);
+    auto setVar2  = ModrobMessage::commandSetValue(2, 2, 32.4);
+
+    VirtualCanTransport::sendToBus(pubNode1);
+    VirtualCanTransport::sendToBus(pubNode2);
+
+    // node1.run(1);
+    // node2.run(1);
+    // broker.run(1);
+
+    // TEST_ASSERT_EQUAL(var1.hertz, 100);
+    // TEST_ASSERT_EQUAL(var2.hertz, 0);
+    // VariableInfo& var_info1 = broker.find_publisher(1, 1, check_key);
+    // TEST_ASSERT_EQUAL(var_info1.moduleID, 1);
+    // TEST_ASSERT_EQUAL(var_info1.value, 0);
+    // VariableInfo& var_info2 = broker.find_publisher(2, 2, check_key);
+    // TEST_ASSERT_EQUAL(var_info2.moduleID, 2);
+    // TEST_ASSERT_EQUAL(var_info2.value, 0);
+    
+
+    // node1.run(2);
+    // node2.run(2);
+    // broker.run(2);
+
+    // TEST_ASSERT_EQUAL(var1.hertz, 100);
+    // TEST_ASSERT_EQUAL(var2.hertz, 200);
+    // var_info1 = broker.find_publisher(1, 1, check_key);
+    // TEST_ASSERT_EQUAL(var_info1.moduleID, 1);
+    // TEST_ASSERT_EQUAL(var_info1.value, 0);
+    // var_info2 = broker.find_publisher(2, 2, check_key);
+    // TEST_ASSERT_EQUAL(var_info2.moduleID, 2);
+    // TEST_ASSERT_EQUAL(var_info2.value, 0);
+
+    VirtualCanTransport::sendToBus(setVar1);
+    VirtualCanTransport::sendToBus(setVar2);
+
+    // node1.run(3);
+    // node2.run(3);
+    // broker.run(3);
+
+    // TEST_ASSERT_EQUAL(var1.value, 12.12);
+    // var_info1 = broker.find_publisher(1, 1, check_key);
+    // TEST_ASSERT_EQUAL(var_info1.moduleID, 1);
+    // TEST_ASSERT_EQUAL(var_info1.value, 0);
+    // var_info2 = broker.find_publisher(2, 2, check_key);
+    // TEST_ASSERT_EQUAL(var_info2.moduleID, 2);
+    // TEST_ASSERT_EQUAL(var_info2.value, 0);
+
+    // node1.run(4);
+    // node2.run(4);
+    // broker.run(4);
+
+    // TEST_ASSERT_EQUAL(var1.value, 12.12);
+    // TEST_ASSERT_EQUAL(var2.value, 32.4);
+    // var_info1 = broker.find_publisher(1, 1, check_key);
+    // TEST_ASSERT_EQUAL(var_info1.moduleID, 1);
+    // TEST_ASSERT_EQUAL(var_info1.value, 0);
+    // var_info2 = broker.find_publisher(2, 2, check_key);
+    // TEST_ASSERT_EQUAL(var_info2.moduleID, 2);
+    // TEST_ASSERT_EQUAL(var_info2.value, 0);
+    
+    // node1.run(5001);
+    // node2.run(5001);
+    // broker.run(5001);
+
+    // var_info1 = broker.find_publisher(1, 1, check_key);
+    // TEST_ASSERT_EQUAL(var_info1.moduleID, 1);
+    // var_info2 = broker.find_publisher(2, 2, check_key);
+    // TEST_ASSERT_EQUAL(var_info2.value, 32.4);
+
+    // node1.run(10002);
+    // node2.run(10002);
+    // broker.run(10002);
+
+    
+
+
+    for (long t = 0; t < 21000; t++)
+    {
+        node1.run(t);
+        node2.run(t);
+        broker.run(t);
+    }
+
+}
+
 
 int main()
 {
     UNITY_BEGIN();
     RUN_TEST(test_size_of_structures);
-    RUN_TEST(test_modrob_adding_variables);
-    RUN_TEST(test_modrob_get_set_var);
-    RUN_TEST(test_modrob_messages_from_to);
-    RUN_TEST(test_modrob_messages_from_to_value);
-    RUN_TEST(test_modrob_messages_set_get_address);
-    RUN_TEST(test_modrob_messages_change_var);
-    RUN_TEST(test_modrob_messages_change_hertz);
-    RUN_TEST(test_modrob_messages_change_subscription_address);
-    RUN_TEST(test_modrob_messages_change_broadcast_change_var);
+    // RUN_TEST(test_modrob_adding_variables);
+    // RUN_TEST(test_modrob_get_set_var);
+    // RUN_TEST(test_modrob_messages_from_to);
+    // RUN_TEST(test_modrob_messages_from_to_value);
+    // RUN_TEST(test_modrob_messages_set_get_address);
+    // RUN_TEST(test_modrob_messages_change_var);
+    // RUN_TEST(test_modrob_messages_change_hertz);
+    // RUN_TEST(test_modrob_messages_change_subscription_address);
+    // RUN_TEST(test_modrob_messages_change_broadcast_change_var);
     // RUN_TEST(test_modrob_multi_nodes_subscribe);
     // RUN_TEST(test_modrob_can_frames_receive);
     // RUN_TEST(test_lwrb_playground);
     RUN_TEST(test_arduinojson);
+    // RUN_TEST(test_compose_decompose_hashID);
+    RUN_TEST(test_modrob_hash_tables);
+    RUN_TEST(test_modrob_aggregator);
     UNITY_END();
 
 }

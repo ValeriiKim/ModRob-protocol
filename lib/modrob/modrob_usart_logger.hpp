@@ -15,7 +15,12 @@ private:
         usart2::usart_send_string("\n");
     }
 
+
 public:
+    static void send_int(int value)
+    {
+        usart2::usart_send_int(value, 1);
+    }
 
     static void info(const char* message)
     {

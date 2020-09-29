@@ -127,7 +127,7 @@ namespace modrob {
             msg.moduleID = toModule;
             msg.variableID = toVar;
             msg.targetVariableID = toVar;
-            msg.setValue(newValue); // НАДО ПОПРАВИТЬ (newValue теперь float)
+            msg.setValue(newValue); 
             msg.operationType   = OperationType::SetVariable;
             msg.messageType = MessageType::Command;
             return msg;
@@ -159,7 +159,7 @@ namespace modrob {
             ModrobMessage msg = {};
             msg.moduleID = fromModule;
             msg.variableID = fromVar;
-            msg.setValue(newValue); // НАДО ПОПРАВИТЬ (newValue теперь float)
+            msg.setValue(newValue);
             msg.operationType = OperationType::SetVariable;
             msg.messageType = MessageType::Publication;
             msg.typeID = typeID;
@@ -378,17 +378,34 @@ namespace modrob {
     };
     NoopTransport Node::defaultTransport{};
 
-    /**
-     * сжатый формат для переменной
-     * для агрегирования значений со всех модулей
-     */
-    struct VariableInfo{
-        uint16_t moduleID;
-        uint8_t  variableID;
-        uint8_t  typeID;
-        uint32_t value;
+    enum class AggregatorMessage: uint8_t {
+        Logging = 0,
+        VarTable = 1,
     };
 
+    /**
+     * сжатый формат для переменной и её модуля
+     * для агрегирования значений со всех модулей и логирования
+     */
+    struct VariableInfo
+    {
+        uint16_t moduleID;
+        uint8_t variableID{0};
+        uint8_t typeID;
+        uint16_t hertz{0};
+        float value;
+        uint16_t subscribeFromModuleID{0};
+        uint8_t subscribeFromVariableID{0};
+        long timeOfLastSend = 0;
+        bool isChanged = false;
+        bool isLogged = false;
+    };
+
+    struct JSONTransport
+    {
+        virtual void send(const VariableInfo &variable, AggregatorMessage type) = 0;
+        virtual bool receive(VariableInfo &result) = 0;
+    };
 }
 
 

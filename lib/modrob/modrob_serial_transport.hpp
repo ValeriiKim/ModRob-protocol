@@ -18,7 +18,7 @@ class SerialJSONTransport : public JSONTransport
 public:
     SerialJSONTransport(){}
 
-    void send(const VariableInfo &variable, AggregatorMessage type) override
+    void send(const ModrobInfo &variable, AggregatorMessage type) override
     {
         // const size_t capacity = JSON_OBJECT_SIZE(4);
         StaticJsonDocument<256> doc;
@@ -43,12 +43,36 @@ public:
             serial_buffer[strlen(serial_buffer)] = '\n';
             usart2::usart_send_string(serial_buffer);
             break;
+
+        case AggregatorMessage::NodeTable:
+            doc["Table"] = "Nodes";
+            doc["modID"] = variable.moduleID;
+            doc["typeID"] = variable.typeID;
+            switch (variable.status)
+            {
+            case NodeStatus::Off:
+                doc["status"] = "Off";
+                break;
+            
+            case NodeStatus::Passive:
+                doc["status"] = "Passive";
+                break;
+
+            case NodeStatus::Active:
+                doc["status"] = "Active";
+                break;
+            }
+            doc["pubVarNum"] = variable.pubVarNum;
+            serializeJson(doc, serial_buffer);
+            serial_buffer[strlen(serial_buffer)] = '\n';
+            usart2::usart_send_string(serial_buffer);
+            break;
         }
 
         memset(serial_buffer, 0, sizeof(serial_buffer));
     }
 
-    bool receive(VariableInfo& result) override
+    bool receive(ModrobInfo& result) override
     {
         return true;
     }

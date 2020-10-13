@@ -6,27 +6,32 @@
 
 using namespace modrob;
 
-
-
 class Aggregator : public Node
 {
     // счётчик публикующихся переменных
     uint16_t pub_count;
     bool stop_all_log = false;
 
-    KHASH_MAP_INIT_INT(pub, VariableInfo);
+    KHASH_MAP_INIT_INT(pub, ModrobInfo);
     khash_t(pub) *publishers = kh_init(pub);
+
+    KHASH_MAP_INIT_INT(nodes, ModrobInfo);
+    khash_t(nodes) *node_table = kh_init(nodes);
+
+    long timeOfLastMonitor = 0;
+
     JSONTransport* upperTransport;
     AggregatorMessage msgType;
 
 public:
-    uint16_t cnt = 0;
+
     Aggregator(uint16_t address, uint8_t typeId): Node(address, typeId) {}
 
     void run(long time_us)
     {
-        handleIncomingModRobMessages();
+        handleIncomingModRobMessages(time_us);
         log_variables(time_us);
+        nodes_monitoring(time_us);
     }
 
     void setUpperTransport(JSONTransport& newTransport)
@@ -66,7 +71,7 @@ public:
  * @param varID_find идентификатор переменной, которую мы ищем
  * @return ссылка на структуру найденной переменной
  */
-    VariableInfo& find_publisher(uint16_t modID_find, uint8_t varID_find, khint_t& check_key)
+    ModrobInfo& find_publisher(uint16_t modID_find, uint8_t varID_find, khint_t& check_key)
     {
         int id_to_find = 0;
         khint_t key;
@@ -93,27 +98,39 @@ public:
         pub_count--;
     }
 
+/** Включение логирование переменной (пробрасываем наверх)
+ * @param modID_to_log идентификатор модуля, переменную которого мы хотим логировать
+ * @param varID_to_log идентификатор переменной, которую мы хотим логировать
+ */
     void set_logging(uint16_t modID_to_log, uint8_t varID_to_log)
     {
         unsigned int check_key;
-        VariableInfo& publisher_to_log = find_publisher(modID_to_log, varID_to_log, check_key);
+        ModrobInfo& publisher_to_log = find_publisher(modID_to_log, varID_to_log, check_key);
         if (check_key == kh_end(publishers)) {return;}
         publisher_to_log.isLogged = true;
     }
 
+/** Выключение логирования переменной (останавливаем пробрасывание наверх)
+ * @param modID_to_log идентификатор модуля, переменная которого больше не должна логироваться
+ * @param varID_to_log идентификатор переменной, которую отключаем от логирования
+ */
     void reset_logging(uint16_t modID_to_log, uint8_t varID_to_log)
     {
         unsigned int check_key;
-        VariableInfo& publisher_to_log = find_publisher(modID_to_log, varID_to_log, check_key);
+        ModrobInfo& publisher_to_log = find_publisher(modID_to_log, varID_to_log, check_key);
         if (check_key == kh_end(publishers)) {return;}
         publisher_to_log.isLogged = false;
     }
 
+/** Получаем число публикующихся переменных
+ * @return число публикующихся переменных
+ */
     int get_publishers_num()
     {
         return kh_size(publishers);
     }
 
+/** Отправляем список публикующихся переменных */
     void send_publishers_table()
     {
         stop_all_log = true;
@@ -127,29 +144,91 @@ public:
         stop_all_log = false;
     }
 
-    // void send_publishers_info()
-    // {
-    //     uint8_t num = get_publishers_num();
-    //     VariableInfo var;
-    //     var.hertz = num;
-    //     upperTransport->send(var);
-    // }
+    void add_new_node(uint8_t typeID, uint16_t modID, uint8_t pubVarNum)
+    {
+        khint_t key;
+        int id = 0;
+        int ret;
+        compose_hashID(id, modID, typeID);
+        key = kh_put(nodes, node_table, id, &ret);
+        if (ret == -1){
+            return;
+        }
+    }
+
+    ModrobInfo& find_node(int8_t typeID_find, uint16_t modID_find, khint_t& check_key)
+    {
+        int id_to_find = 0;
+        khint_t key;
+        compose_hashID(id_to_find, modID_find, typeID_find);
+        key = kh_get(nodes, node_table, id_to_find);
+        check_key = key;
+        return kh_value(node_table, key);
+    }
+
+
+    void send_node_table()
+    {
+        stop_all_log = true;
+        khint_t key;
+        msgType = AggregatorMessage::NodeTable;
+        for (key = kh_begin(node_table); key != kh_end(node_table); ++key) 
+        {
+            if (kh_exist(node_table, key)) {
+                upperTransport->send(kh_value(node_table, key), msgType);
+            }
+        }
+        stop_all_log = false;
+    }
+
+/** Получаем число модулей на шине
+ * @return число модулей на шине
+ */
+    int get_nodes_num()
+    {
+        return kh_size(node_table);
+    }
 
 private:
-
-    void handleIncomingModRobMessages()
+    void handleIncomingModRobMessages(long time)
     {
         bool isReceived = Aggregator::transport->receive(incomingMsg) || isReceivedOutside;
-        if(not isReceived) return;
-        if((incomingMsg.messageType == MessageType::Publication) && (kh_size(publishers) != 0))
+        if (not isReceived)
+            return;
+        if (incomingMsg.messageType == MessageType::Publication)
         {
-            unsigned int check_key;
-            VariableInfo& var_to_update = find_publisher(incomingMsg.moduleID, incomingMsg.variableID, check_key); 
-            if (check_key == kh_end(publishers)) {
-                return;
+            if ((incomingMsg.operationType == OperationType::SetVariable) && (kh_size(publishers) != 0))
+            {
+                unsigned int check_key;
+                ModrobInfo &var_to_update = find_publisher(incomingMsg.moduleID, incomingMsg.variableID, check_key);
+                if (check_key == kh_end(publishers))
+                {
+                    return;
+                }
+                var_to_update.value = incomingMsg.getValue();
+                var_to_update.isChanged = true;
             }
-            var_to_update.value = incomingMsg.getValue();
-            var_to_update.isChanged = true;
+            else if (incomingMsg.operationType == OperationType::HeartBeat)
+            {
+                int id = 0;
+                int ret;
+                khint_t key;
+                compose_hashID(id, incomingMsg.moduleID, incomingMsg.typeID);
+                key = kh_put(nodes, node_table, id, &ret);
+                if (ret == -1) {
+                    return;
+                }
+                kh_value(node_table, key).moduleID       = incomingMsg.moduleID;
+                kh_value(node_table, key).typeID         = incomingMsg.typeID;
+                kh_value(node_table, key).pubVarNum      = incomingMsg.value;
+                kh_value(node_table, key).timeOfLastBeat = time;
+                if (kh_value(node_table, key).pubVarNum > 0) {
+                    kh_value(node_table, key).status = NodeStatus::Active;
+                }
+                else {
+                    kh_value(node_table, key).status = NodeStatus::Passive;
+                }
+            }
         }
         isReceivedOutside = false;
     }
@@ -159,18 +238,39 @@ private:
         if (stop_all_log) {return;}
         khint_t key;
         msgType = AggregatorMessage::Logging;
-        for (key = kh_begin(publishers); key != kh_end(publishers); ++key){
-            if (kh_exist(publishers, key) && kh_value(publishers, key).isLogged){
-                if(kh_value(publishers, key).hertz > 0){
+        for (key = kh_begin(publishers); key != kh_end(publishers); ++key) {
+            if (kh_exist(publishers, key) && kh_value(publishers, key).isLogged) {
+                if(kh_value(publishers, key).hertz > 0) {
                     int microsDelay = 1000000 / kh_value(publishers, key).hertz;
-                    // Logger::send_int(kh_value(publishers, key).timeOfLastSend);
-                    if (time - kh_value(publishers, key).timeOfLastSend > microsDelay){
+                    if (time - kh_value(publishers, key).timeOfLastSend > microsDelay) {
                         kh_value(publishers, key).timeOfLastSend = time;
                         upperTransport->send(kh_value(publishers, key), msgType);
                     }
                 }
             }
         }
+    }
+
+    void nodes_monitoring(long time)
+    {
+        if (time - timeOfLastMonitor > SECOND) {
+            khint_t key;
+            for (key = kh_begin(node_table); key != kh_end(node_table); ++key)
+            {
+                if (kh_exist(node_table, key)) {
+                    if (time - kh_value(node_table, key).timeOfLastBeat > 3 * SECOND) {
+                        kh_value(node_table, key).status = NodeStatus::Off;
+                    }
+                    else {
+                        kh_value(node_table, key).status = NodeStatus::Passive;
+                    }
+                    if (kh_value(node_table, key).pubVarNum > 0) {
+                        kh_value(node_table, key).status = NodeStatus::Active;
+                    }
+                }
+            }
+        }
+        timeOfLastMonitor = time;
     }
 
 

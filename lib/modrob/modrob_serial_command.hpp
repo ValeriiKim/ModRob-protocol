@@ -19,6 +19,7 @@ constexpr size_t MAX_BUFFERED_COMMANDS     = 10;
 #define COMMAND_STOP_LOG    "stopLog"
 #define COMMAND_GET_PUB     "request_publishers_table"
 #define COMMAND_RESET_PUB   "removePublication"
+#define COMMAND_GET_NODES   "request_nodes_table"
 
 #define MOD_FIELD "modID"
 #define VAR_FIELD "varID"
@@ -50,7 +51,9 @@ struct Serial_Message
  * {"op": "setPublication", "modID": N, "varID": N, "frequency": V}
  * {"op": "setSubscription", "modID": N, "varID": N, "subModID": V, "subVarID": V}
  * {"op": "startLog", "modID": N, "varID": V}
+ * {"op": "stopLog", "modID": N, "varID": V}
  * {"op": "request_publishers_table"}
+ * {"op": "request_nodes_table"}
 }
 
  *
@@ -146,6 +149,10 @@ private:
         return doc[COMMAND_FIELD].as<string>() == COMMAND_GET_PUB;
     }
 
+    bool isValidGetNodeTable(){
+        return doc[COMMAND_FIELD].as<string>() == COMMAND_GET_NODES;
+    }
+
 public:
     SerialCommander()
     {
@@ -219,6 +226,10 @@ public:
                         else if (isValidGetPubTable())
                         {
                             node.send_publishers_table();
+                        }
+                        else if (isValidGetNodeTable())
+                        {
+                            node.send_node_table();
                         }
                         else {
                             Logger::warn("Not match command");

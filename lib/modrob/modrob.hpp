@@ -5,8 +5,9 @@
 #include <cstdint>
 #include "fixed_vector.hpp"
 //#include <cmath>
-//#include <string>
-//#include<iostream>
+
+#define SECOND 1000000
+
 
 using namespace std;
 
@@ -21,6 +22,13 @@ namespace modrob {
         SetVariable = 0,
         SetFreqOfPublications = 1,
         SetSubscriptionAddress = 2,
+        HeartBeat = 3
+    };
+
+    enum class NodeStatus: uint8_t {
+        Off     = 0,
+        Passive = 1,
+        Active  = 2
     };
 
 
@@ -166,6 +174,17 @@ namespace modrob {
             return msg;
         }
 
+        static ModrobMessage heartBeat(uint8_t typeID, uint16_t fromModule, uint8_t pubVarNum){
+            ModrobMessage msg = {};
+            msg.moduleID = fromModule;
+            msg.variableID = 0;
+            msg.value = static_cast<uint32_t>(pubVarNum);
+            msg.operationType = OperationType::HeartBeat;
+            msg.messageType = MessageType::Publication;
+            msg.typeID = typeID;
+            return msg;
+        }
+
     private:
 
     };
@@ -270,6 +289,9 @@ namespace modrob {
         static NoopTransport defaultTransport;
         ModrobTransport* transport = &defaultTransport;
 
+        volatile long timeOfLastBeat = 0;
+        uint8_t pubVarNum = 0;
+
         explicit Node(uint16_t address, uint8_t typeId):
             selfModuleID(address), selfModuleTypeId(typeId){
         }
@@ -311,6 +333,7 @@ namespace modrob {
         void run(long time_us){
             handleIncomingModRobMessages(); // TODO: желательно вызывать на частоте > 5 kHZ
             publishAllVariables(time_us);
+            sendHeartBeat(time_us);
         }
 
     private:
@@ -375,37 +398,51 @@ namespace modrob {
                 }
             }
         }
+
+        void sendHeartBeat(long time){
+            if (time - timeOfLastBeat > SECOND) {
+                outgoingMsg = ModrobMessage::heartBeat(selfModuleTypeId, selfModuleID, pubVarNum);
+                transport->send(outgoingMsg);
+                timeOfLastBeat = time;
+            }
+        }
+
+
     };
     NoopTransport Node::defaultTransport{};
 
     enum class AggregatorMessage: uint8_t {
-        Logging = 0,
-        VarTable = 1,
+        Logging   = 0,
+        VarTable  = 1,
+        NodeTable = 2
     };
 
     /**
      * сжатый формат для переменной и её модуля
-     * для агрегирования значений со всех модулей и логирования
+     * для агрегирования значений со всех модулей и логирования, а также для 
+     * отправки heartbeat
      */
-    struct VariableInfo
+    struct ModrobInfo
     {
         uint16_t moduleID;
         uint8_t variableID{0};
         uint8_t typeID;
-        uint16_t hertz{0};
+        uint32_t hertz{0};
         float value;
-        uint16_t subscribeFromModuleID{0};
-        uint8_t subscribeFromVariableID{0};
         long timeOfLastSend = 0;
         bool isChanged = false;
         bool isLogged = false;
+        NodeStatus status;
+        uint8_t pubVarNum;
+        long timeOfLastBeat;
     };
 
     struct JSONTransport
     {
-        virtual void send(const VariableInfo &variable, AggregatorMessage type) = 0;
-        virtual bool receive(VariableInfo &result) = 0;
+        virtual void send(const ModrobInfo &variable, AggregatorMessage type) = 0;
+        virtual bool receive(ModrobInfo &result) = 0;
     };
+
 }
 
 

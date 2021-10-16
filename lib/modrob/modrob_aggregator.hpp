@@ -60,6 +60,7 @@ public:
         kh_value(publishers, key).hertz = pub_hertz;
         kh_value(publishers, key).timeOfLastSend = 0;
         kh_value(publishers, key).value = 0;
+        // kh_value(publishers, key).name = 
         kh_value(publishers, key).isLogged = false;
         pub_count++;
 
@@ -260,6 +261,7 @@ private:
                 if (kh_exist(node_table, key)) {
                     if (time - kh_value(node_table, key).timeOfLastBeat > 3 * SECOND) {
                         kh_value(node_table, key).status = NodeStatus::Off;
+                        break;
                     }
                     else {
                         kh_value(node_table, key).status = NodeStatus::Passive;
@@ -269,8 +271,8 @@ private:
                     }
                 }
             }
+            timeOfLastMonitor = time;
         }
-        timeOfLastMonitor = time;
     }
 
 

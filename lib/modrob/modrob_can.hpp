@@ -3,7 +3,7 @@
 
 #include "modrob.hpp"
 #include "can_config.h"
-#include "usart_dma_config.h"
+#include "usart_dma_config.h" // для отладки
 
 using namespace modrob;
 using namespace can_bus;

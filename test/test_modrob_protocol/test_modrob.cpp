@@ -113,24 +113,25 @@ void test_size_of_structures(){
 
 void test_modrob_adding_variables(){
     Node node(1, 11);
-    node.createVariable(0, "name1", "unit1", 0.0);
+    node.createVariable(0, "name0", "unit1", 0.0);
     node.createVariable(1, "name1", "unit1", 0.0);
-    node.createVariable(2, "name1", "unit1", 0.0);
-    node.createVariable(3, "name1", "unit1", 0.0);
-    node.createVariable(4, "name1", "unit1", 0.0);
+    node.createVariable(2, "name2", "unit1", 0.0);
+    node.createVariable(3, "name3", "unit1", 0.0);
+    node.createVariable(4, "name4", "unit1", 0.0);
     TEST_ASSERT_EQUAL(node.variables.size(), 5);
 }
 
 /** Проверка соответствия между установкой и получением значения float 
- * modrob переменной 
+ * modrob переменной, а также установленным именем
 */
 void test_modrob_get_set_var()
 {
     Node node(10, 11);
-    auto v = node.createVariable(0, "name1", "unit1", 5.0F);
+    auto v = node.createVariable(0, "sensor1", "unit1", 5.0F);
     TEST_ASSERT(v.get() == 5.0F);
     v.set(10.0F);
     TEST_ASSERT(v.get() == 10.0F);
+    TEST_ASSERT_EQUAL_CHAR_ARRAY(v.name, "sensor1", strlen(v.name));
 }
 
 static uint64_t numberOfTestIteration = 1000000L;
@@ -187,19 +188,6 @@ void test_modrob_messages_from_to_value()
 
         TEST_ASSERT(m2.getValue() == new_value);
     }
-    // float value = 2.1;
-    // m1.setValue(value);
-    // unsigned int canID = 0;
-    // unsigned char data[8];
-    // m1.toCan(canID, data);
-    // cout << std::bitset<8>(data[0]) << endl;
-    // cout << std::bitset<8>(data[1]) << endl;
-    // cout << std::bitset<8>(data[2]) << endl;
-    // cout << std::bitset<8>(data[3]) << endl;
-    // cout << std::bitset<8>(data[4]) << endl;
-    // cout << std::bitset<8>(data[5]) << endl;
-    // cout << std::bitset<8>(data[6]) << endl;
-
 }
 
 
@@ -552,7 +540,7 @@ void test_arduinojson()
     doc["hertz"] = 1500;
 
     char serial_buffer[256] = "12345\n";
-    cout << strlen(serial_buffer) << endl;
+    cout << strlen(serial_buffer) << endl; 
     cout << serial_buffer[strlen(serial_buffer)-2] << endl;
     cout << "Number of bytes written by JSON: " << serializeJson(doc, serial_buffer) << endl;
     cout << serial_buffer << endl;
@@ -566,7 +554,7 @@ int main()
     UNITY_BEGIN();
     RUN_TEST(test_size_of_structures);
     // RUN_TEST(test_modrob_adding_variables);
-    // RUN_TEST(test_modrob_get_set_var);
+    RUN_TEST(test_modrob_get_set_var);
     // RUN_TEST(test_modrob_messages_from_to);
     // RUN_TEST(test_modrob_messages_from_to_value);
     // RUN_TEST(test_modrob_messages_set_get_address);

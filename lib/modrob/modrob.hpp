@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include "fixed_vector.hpp"
+#include <string.h>
 //#include <cmath>
 
 #define SECOND 1000000
@@ -85,7 +86,7 @@ namespace modrob {
         }
 
         /**
-         * Преобразует Modrob сообщение в бинарный формат CAN
+         * Преобразует Modrob сообщение в бинарный формат CAN (по-хорошему должно быть не здесь)
          * @param id идентификатор CAN сообщения, который формируется согласно протоколу
          * @param packet полезные данные CAN фрейма
          */
@@ -106,7 +107,7 @@ namespace modrob {
         }
 
         /**
-         * Преобразует CAN сообщение в Modrob сообщение
+         * Преобразует CAN сообщение в Modrob сообщение (по-хорошему должно быть не здесь)
          * @param id Идентификатор CAN сообщения, из которого формируется протокольное сообщение
          * @param packet Полезные данные CAN сообщения
          */
@@ -241,7 +242,8 @@ namespace modrob {
         float value;
         float maxValue{0};
         float minValue{0};
-//        string name;
+        char name[16];
+        // char name[20]{0};
 //        string description;
 //        string unit; // Measurement unit
         long hertz{0}; // частота публикации переменной
@@ -254,8 +256,9 @@ namespace modrob {
         bool isSubscribed = false;
         bool isPublished = false; // for debug purpose
 
-        Variable(uint8_t _id, float value): id(_id){
+        Variable(uint8_t _id, float value, const char* new_name): id(_id){
             set(value);
+            memcpy(name, new_name, strlen(new_name));
         }
 
         void set(float val){
@@ -308,7 +311,7 @@ namespace modrob {
             // TODO: проверка на дублирующиеся ID (замена или игнор)
             // если есть ещё место для добавления новой переменной
             if(not variables.full()){
-                Variable& var = variables.emplace_back(id, defaultValue); // добавляем новую переменную в вектор
+                Variable& var = variables.emplace_back(id, defaultValue, name); // добавляем новую переменную в вектор
                 return var;              // возвращаем ссылку на новую переменную
             }else{
                 return variables.back(); // если места нет, возвращаем последнюю переменную вектора
@@ -434,7 +437,7 @@ namespace modrob {
         bool isLogged = false;
         NodeStatus status;
         uint8_t pubVarNum;
-        long timeOfLastBeat;
+        long timeOfLastBeat{0};
     };
 
     struct JSONTransport

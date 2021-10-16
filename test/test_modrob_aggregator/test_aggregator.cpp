@@ -361,7 +361,6 @@ void test_modrob_aggregator()
         broker.run(t);
     }
     broker.send_publishers_table();
-
 }
 
 
@@ -402,12 +401,55 @@ void test_modrob_heartbeat()
     TEST_ASSERT_EQUAL(broker.get_nodes_num(), 3);
 }
 
+void test_modrob_heartbeat_status()
+{
+    VirtualCanTransport::clear();
+    VirtualCanTransport can0 = VirtualCanTransport(0);
+    VirtualCanTransport can1 = VirtualCanTransport(1);
+    VirtualCanTransport can2 = VirtualCanTransport(2);
+    VirtualCanTransport can3 = VirtualCanTransport(3);
+    VirtualSerialTransport virtual_transport;
+    Aggregator broker(0, 0);
+    Node node1 = Node(1, 1);
+    Node node2 = Node(2, 2);
+    Node node3 = Node(3, 3);
+    broker.setUpperTransport(virtual_transport);
+    broker.setTransport(can0);
+    node1.setTransport(can1);
+    node2.setTransport(can2);
+    node3.setTransport(can3);
+    node1.pubVarNum = 1;
+    node2.pubVarNum = 1;
+    node3.pubVarNum = 1;
+    
+    for (long t = 0; t < 10*SECOND + 100; t++)
+    {
+        if (t < 5*SECOND) {
+            node1.run(t);
+        }
+        node2.run(t);
+        node3.run(t);
+        broker.run(t);
+        if (t == 2 * SECOND) {
+            broker.send_node_table();
+        }
+        if (t == 3 * SECOND) {
+            node1.pubVarNum = 0;
+            node2.pubVarNum = 0;
+        }
+    }
+    // TEST_ASSERT_EQUAL(num_of_heartbeats, 15);
+    broker.send_node_table();
+}
+
+
 int main()
 {
     UNITY_BEGIN();
     // RUN_TEST(test_modrob_hash_tables);
     RUN_TEST(test_modrob_aggregator);
     RUN_TEST(test_modrob_heartbeat);
+    RUN_TEST(test_modrob_heartbeat_status);
     UNITY_END();
 
 }

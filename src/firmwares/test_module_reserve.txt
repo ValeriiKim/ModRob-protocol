@@ -24,6 +24,11 @@
 CanModrobTransport can_transport;
 // SerialCommander commander;
 
+
+void new_func(){
+	
+}
+
 int main() {
 	board::system_config();
 	board::sys_tick_init();

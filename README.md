@@ -45,9 +45,9 @@ Now there are 5 modrob messages:
 | Message | Input parameters | Description | 
 | ----------- | ----------- | ----------- | 
 | `HeartBeat` | 1. Module's ID<br/>2. Module's typeID | Message used to synchronize submodules on the bus. <br/> It allows monitoring the presence of submodules on the bus. |
-| `commandSetValue` | 1. Target module's ID<br/> 2. Target variable's ID<br/> 3. Value of a variable | The command sets new value of a target variable of<br/> a target module  | 
-| `commandSetHertz` | 1. Target module's ID<br/> 2. Target variable's ID<br/> 3. Frequency value | The command sets new frequency of publication of a target<br/> variable of a target module |
-| `publishNewValue` | 1. Module's typeID<br/> 2. Publishing module's ID<br/> 3. Publishing variable's ID<br/> 4. Value of a variable | The command allows publishing value of a target<br/> variable on a bus (multicast message) |
-| `commandSetSubscriptionAddress` | 1. Subscriber module's ID<br/> 2. ID of subscriber module's variable<br/> 3. Publisher module's ID<br/> 4. ID of publisher module's variable | The command subscribes the specified subscriber module variable<br/> to the specified publisher module variable, i.e. changing the publisher variable will change the subscriber variable. However, to do this, the subscriber variable must be published with a non-zero frequency |
+| `commandSetValue` | 1. Target module's ID<br/> 2. Target variable's ID<br/> 3. Value of a variable | The command sets new value of a target variable of a target module  | 
+| `commandSetHertz` | 1. Target module's ID<br/> 2. Target variable's ID<br/> 3. Frequency value | The command sets new frequency of publication of a target variable of a target module |
+| `publishNewValue` | 1. Module's typeID<br/> 2. Publishing module's ID<br/> 3. Publishing variable's ID<br/> 4. Value of a variable | The command allows publishing value of a target variable on a bus (multicast message) |
+| `commandSetSubscriptionAddress` | 1. Subscriber module's ID<br/> 2. ID of subscriber module's variable<br/> 3. Publisher module's ID<br/> 4. ID of publisher module's variable | The command subscribes the specified subscriber module variable to the specified publisher module variable, i.e. changing the publisher variable will change the subscriber variable. However, to do this, the subscriber variable must be published with a non-zero frequency |
  
 
